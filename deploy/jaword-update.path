@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch for jaword update requests
+
+[Path]
+PathExists=/var/lib/jaword/update/request.json
+
+[Install]
+WantedBy=multi-user.target

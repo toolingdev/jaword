@@ -1,0 +1,119 @@
+#!/bin/sh
+# jaword-updater: privileged half of the vault's self-update. Runs as root.
+#
+# Triggered by jaword-update.path when the (unprivileged) vault drops
+# /var/lib/jaword/update/request.json, or by hand:
+#     jaword-updater check
+#     jaword-updater apply v0.2.0
+#
+# Trust model: nothing from the vault process is trusted except the requested
+# version string, and that is validated. A release is installed only if its
+# signature verifies against /etc/jaword/release_signers (root-owned). The
+# signature namespace contains the version and file name, so an old signed
+# binary cannot be replayed as a newer release.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+REPO="${JAWORD_UPDATE_REPO:-toolingdev/jaword}"
+SIGNERS=/etc/jaword/release_signers
+REQ=/var/lib/jaword/update/request.json
+RUN=/run/jaword-update
+BIN=/usr/local/bin/jawordd
+ASSET=jawordd-x86_64-linux-musl
+LATEST=""
+WORK=""
+
+umask 022
+mkdir -p "$RUN"
+
+valid() { printf '%s' "$1" | grep -Eq '^v[0-9]{1,5}\.[0-9]{1,5}\.[0-9]{1,5}$'; }
+current() { "$BIN" --version 2>/dev/null | awk 'NR==1 {print "v"$2}'; }
+
+# status STATE MESSAGE  (message must be a fixed string: it is not escaped)
+status() {
+  tmp=$(mktemp "$RUN/.status.XXXXXX")
+  printf '{"state":"%s","message":"%s","latest":"%s","installed":"%s","ts":%s}\n' \
+    "$1" "$2" "$LATEST" "$(current)" "$(date +%s)" > "$tmp"
+  chmod 644 "$tmp"
+  mv "$tmp" "$RUN/status.json"
+  echo "jaword-updater: $1: $2"
+}
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; return 0; }
+trap cleanup EXIT
+fail() { status failed "$1"; exit 1; }
+
+fetch() { curl -fsSL --proto '=https' --tlsv1.2 -m 180 --max-filesize 52428800 -o "$2" "$1"; }
+
+check() {
+  status checking "Looking for the latest release"
+  body=$(mktemp "$RUN/.latest.XXXXXX")
+  code=$(curl -sSL --proto '=https' --tlsv1.2 -m 30 -H 'Accept: application/vnd.github+json' \
+         -o "$body" -w '%{http_code}' "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null) || code=000
+  tag=$(grep -o '"tag_name": *"v[0-9][0-9.]*"' "$body" 2>/dev/null | head -1 | grep -o 'v[0-9.]*') || true
+  rm -f "$body"
+  if [ "$code" = 404 ]; then status idle "No release has been published yet"; return 0; fi
+  [ "$code" = 200 ] || fail "Could not reach the release server"
+  valid "${tag:-}" || fail "Could not read the latest release"
+  LATEST=$tag
+  if [ "$LATEST" = "$(current)" ]; then status idle "Up to date"; else status idle "Release available"; fi
+}
+
+apply() {
+  V=$1
+  valid "$V" || fail "Invalid version"
+  LATEST=$V
+  [ -s "$SIGNERS" ] || fail "Updates are disabled: no release signing key installed"
+  CUR=$(current)
+  [ "$V" != "$CUR" ] || fail "That version is already installed"
+  newest=$(printf '%s\n%s\n' "$CUR" "$V" | sort -V | tail -1)
+  [ "$newest" = "$V" ] || fail "Refusing to downgrade"
+
+  WORK=$(mktemp -d /var/lib/jaword-updater.XXXXXX)
+  chmod 700 "$WORK"
+  status downloading "Downloading release"
+  base="https://github.com/$REPO/releases/download/$V"
+  fetch "$base/$ASSET" "$WORK/$ASSET" || fail "Download failed"
+  fetch "$base/$ASSET.sig" "$WORK/$ASSET.sig" || fail "Signature download failed"
+
+  ssh-keygen -Y verify -f "$SIGNERS" -I jaword-release -n "jaword-release-$V-$ASSET" \
+    -s "$WORK/$ASSET.sig" < "$WORK/$ASSET" >/dev/null 2>&1 \
+    || fail "Signature check failed. Nothing was installed"
+  chmod 755 "$WORK/$ASSET"
+  got=$("$WORK/$ASSET" --version 2>/dev/null | awk 'NR==1 {print "v"$2}')
+  [ "$got" = "$V" ] || fail "Release binary reports a different version. Nothing was installed"
+
+  status installing "Installing and restarting"
+  systemctl stop jawordd
+  cp -p "$BIN" "$BIN.prev"
+  install -m 755 "$WORK/$ASSET" "$BIN.new"
+  mv "$BIN.new" "$BIN"
+  systemctl start jawordd || true
+  i=0
+  while [ $i -lt 15 ]; do
+    if curl -fs -m 2 http://127.0.0.1:8200/v1/sys/status 2>/dev/null | grep -q "\"version\":\"${V#v}\""; then
+      status ok "Installed. The vault restarted and is sealed until you unseal it"
+      return 0
+    fi
+    i=$((i + 1)); sleep 1
+  done
+  systemctl stop jawordd || true
+  cp -p "$BIN.prev" "$BIN"
+  systemctl start jawordd || true
+  fail "New version did not start. Rolled back to the previous one"
+}
+
+if [ $# -ge 1 ]; then
+  ACTION=$1; VERSION=${2:-}
+else
+  # The request file lives in a directory the vault user controls: read a
+  # bounded amount, pull out two strictly-shaped fields, never echo the rest.
+  RAW=$(head -c 512 "$REQ" 2>/dev/null || true)
+  rm -f "$REQ"
+  ACTION=$(printf '%s' "$RAW" | grep -o '"action":"[a-z]*"' | head -1 | cut -d'"' -f4)
+  VERSION=$(printf '%s' "$RAW" | grep -o '"version":"v[0-9.]*"' | head -1 | cut -d'"' -f4)
+fi
+
+case "$ACTION" in
+  check) check ;;
+  apply) apply "$VERSION" ;;
+  *) fail "Unknown request" ;;
+esac

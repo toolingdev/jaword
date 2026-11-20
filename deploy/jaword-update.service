@@ -1,0 +1,7 @@
+[Unit]
+Description=jaword signed self-update (root helper)
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/jaword/updater.env
+ExecStart=/usr/local/sbin/jaword-updater

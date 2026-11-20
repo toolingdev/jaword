@@ -1,0 +1,50 @@
+[Unit]
+Description=jaword secrets vault
+Documentation=file:/usr/local/share/doc/jaword/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=jaword
+Group=jaword
+Environment=JAWORD_DB=/var/lib/jaword/vault.db
+Environment=JAWORD_LISTEN=127.0.0.1:8200
+Environment=HOME=/var/lib/jaword
+EnvironmentFile=-/etc/jaword/jawordd.env
+ExecStart=/usr/local/bin/jawordd
+Restart=on-failure
+RestartSec=2
+
+# State: only /var/lib/jaword is writable, and only by this service.
+StateDirectory=jaword
+StateDirectoryMode=0700
+UMask=0077
+
+# Key material lives in memory: never dump it, never let children gain rights.
+LimitCORE=0
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Filesystem and kernel surface.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+[Install]
+WantedBy=multi-user.target
