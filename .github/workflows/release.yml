@@ -1,0 +1,90 @@
+name: release
+
+# Pushing a tag like v0.2.0 builds, signs and publishes a release.
+# The signing key lives only in the JAWORD_RELEASE_KEY repository secret.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - suffix: x86_64-linux-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - suffix: arm64-darwin
+            os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tag must match the crate version
+        shell: bash
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          for f in crates/core/Cargo.toml crates/server/Cargo.toml crates/cli/Cargo.toml; do
+            got=$(grep -m1 '^version = ' "$f" | cut -d'"' -f2)
+            [ "$got" = "$want" ] || { echo "$f is $got, tag is $want"; exit 1; }
+          done
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Collect
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/jaword  dist/jaword-${{ matrix.suffix }}
+          cp target/${{ matrix.target }}/release/jawordd dist/jawordd-${{ matrix.suffix }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.suffix }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: dist-*
+          merge-multiple: true
+      - name: Sign
+        env:
+          JAWORD_RELEASE_KEY: ${{ secrets.JAWORD_RELEASE_KEY }}
+        run: |
+          set -eu
+          [ -n "$JAWORD_RELEASE_KEY" ] || { echo "JAWORD_RELEASE_KEY secret is not set"; exit 1; }
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$JAWORD_RELEASE_KEY" > "$key"
+          chmod 600 "$key"
+          cd dist
+          for f in *; do
+            # The namespace binds each signature to this exact version and file name.
+            ssh-keygen -Y sign -f "$key" -n "jaword-release-$GITHUB_REF_NAME-$f" "$f"
+          done
+          sha256sum $(ls | grep -v '\.sig$') > SHA256SUMS
+          ls -l
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --notes "Signed release $GITHUB_REF_NAME. The vault verifies the signature before installing."

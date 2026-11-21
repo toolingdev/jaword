@@ -204,8 +204,10 @@ The vault can update itself from signed GitHub releases, triggered from the
 web UI (Updates page), `jaword update apply vX.Y.Z`, or the MCP tool
 `vault_update_apply`.
 
-- `scripts/release.sh vX.Y.Z` builds, signs each artifact with an SSH signing
-  key (`ssh-keygen -Y sign`) and publishes a GitHub release.
+- `scripts/release.sh vX.Y.Z` bumps the version and pushes a tag. GitHub
+  Actions builds the binaries, signs each one with an SSH signing key
+  (`ssh-keygen -Y sign`) held in a repository secret, and publishes the
+  release. The matching public key is in `deploy/release_signers`.
 - The vault process only drops a request file. A separate root helper
   (`deploy/jaword-updater`) downloads the release, verifies the signature
   against `/etc/jaword/release_signers`, refuses downgrades, installs, and
@@ -215,9 +217,10 @@ web UI (Updates page), `jaword update apply vX.Y.Z`, or the MCP tool
 - No signers file means updates are off.
 - After an update the vault restarts **sealed**. A human unseals it.
 
-Whoever holds the release signing key can replace the vault's code. Keep it
-somewhere that needs a human approval per signature (for example the
-1Password SSH agent), not in a plain file an agent can read.
+Whoever can push a tag to the release repository can replace the code of
+every vault that trusts its key. Protect that account, or sign releases
+yourself with a key that needs a human approval per signature and trust
+only that key in `/etc/jaword/release_signers`.
 
 ## Not built yet
 
