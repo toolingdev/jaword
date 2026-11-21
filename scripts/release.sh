@@ -13,6 +13,7 @@ V=${1:?usage: release.sh vX.Y.Z}
 printf '%s' "$V" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "version must look like v0.2.0"; exit 2; }
 KEY=${JAWORD_RELEASE_KEY:?set JAWORD_RELEASE_KEY to the release signing key}
 REPO=${JAWORD_UPDATE_REPO:-toolingdev/jaword}
+REMOTE=${JAWORD_RELEASE_REMOTE:-toolingdev}
 cd "$(dirname "$0")/.."
 [ -z "$(git status --porcelain)" ] || { echo "working tree is not clean"; exit 1; }
 
@@ -36,9 +37,9 @@ for f in dist/*; do
 done
 (cd dist && shasum -a 256 $(ls | grep -v '\.sig$') > SHA256SUMS)
 
-git commit -qam "Release $V"
+# UTC so the commit does not record the local timezone.
+TZ=UTC git commit -qam "Release $V"
 git tag "$V"
-git push -q origin main "$V"
-git push -q github main "$V"
+git push -q "$REMOTE" HEAD:main "$V"
 gh release create "$V" dist/* --repo "$REPO" --title "$V" --notes "Signed release $V. The vault verifies the signature before installing."
 echo "released $V"
