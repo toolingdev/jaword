@@ -18,6 +18,8 @@ cd "$(dirname "$0")/.."
 
 for f in crates/core/Cargo.toml crates/server/Cargo.toml crates/cli/Cargo.toml; do
   perl -0pi -e "s/^version = \"[0-9.]+\"/version = \"${V#v}\"/m" "$f"
+  # The crates depend on each other by version as well as by path.
+  perl -pi -e "s/^(jaword-core = \{ version = )\"[0-9.]+\"/\$1\"${V#v}\"/" "$f"
 done
 cargo test -q --workspace
 
