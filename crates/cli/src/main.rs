@@ -71,6 +71,16 @@ enum Cmd {
         #[command(flatten)]
         policy: PolicyArgs,
     },
+    /// Payment cards: the number and security code are typed at a hidden prompt
+    Card {
+        #[command(subcommand)]
+        cmd: CardCmd,
+    },
+    /// Gift cards: store them, record spending, see what is left
+    Gift {
+        #[command(subcommand)]
+        cmd: GiftCmd,
+    },
     /// Store a value you supply as a new version (hidden prompt or --stdin)
     Set {
         path: String,
@@ -192,6 +202,61 @@ enum Cmd {
     },
     /// Run as an MCP server on stdio (for AI agents)
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum CardCmd {
+    /// Add a card, e.g. `jaword card new personal/cards/everyday --title "Everyday Visa" --exp 08/29`
+    New {
+        path: String,
+        #[arg(long, default_value = "")]
+        title: String,
+        /// Name on the card
+        #[arg(long, default_value = "")]
+        holder: String,
+        /// Expiry as MM/YY or MM/YYYY
+        #[arg(long)]
+        exp: Option<String>,
+        /// Billing ZIP or postcode
+        #[arg(long, default_value = "")]
+        zip: String,
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GiftCmd {
+    /// Add a gift card, e.g. `jaword gift new personal/gift/bookshop --merchant Bookshop --balance 50`
+    New {
+        path: String,
+        #[arg(long, default_value = "")]
+        title: String,
+        /// Store or brand the card is for
+        #[arg(long, default_value = "")]
+        merchant: String,
+        /// Money on the card today, e.g. 50 or 37.20
+        #[arg(long, default_value = "0")]
+        balance: String,
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
+    /// Record money spent, e.g. `jaword gift spend personal/gift/bookshop 12.34 --note "two paperbacks"`
+    Spend {
+        path: String,
+        amount: String,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Record money added to the card
+    Add {
+        path: String,
+        amount: String,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    /// Show what is left and the spending history
+    Balance { path: String },
 }
 
 #[derive(Subcommand)]
@@ -453,6 +518,59 @@ pub fn fmt_ts(ts: i64) -> String {
     format!("{y:04}-{m:02}-{d:02} {:02}:{:02}Z", secs / 3600, (secs % 3600) / 60)
 }
 
+/// "12.34", "12", "$12.3" -> cents. Refuses anything it would have to guess at.
+fn parse_money(text: &str) -> i64 {
+    let t = text.trim().trim_start_matches('$').replace(',', "");
+    let (whole, frac) = t.split_once('.').unwrap_or((&t, ""));
+    let ok = !whole.is_empty()
+        && whole.len() <= 8
+        && frac.len() <= 2
+        && whole.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit());
+    if !ok {
+        die("amount must look like 12.34");
+    }
+    let cents = whole.parse::<i64>().unwrap_or(0) * 100 + format!("{frac:0<2}").parse::<i64>().unwrap_or(0);
+    if cents == 0 {
+        die("amount must be more than zero");
+    }
+    cents
+}
+
+fn money(cents: i64) -> String {
+    format!("{}${}.{:02}", if cents < 0 { "-" } else { "" }, cents.abs() / 100, cents.abs() % 100)
+}
+
+/// MM/YY or MM/YYYY -> (month, four-digit year).
+fn parse_expiry(text: &str) -> (u8, u16) {
+    let parsed = text.split_once('/').and_then(|(m, y)| {
+        let m: u8 = m.trim().parse().ok()?;
+        let y: u16 = y.trim().parse().ok()?;
+        Some((m, if y < 100 { 2000 + y } else { y }))
+    });
+    match parsed {
+        Some((m, y)) if (1..=12).contains(&m) => (m, y),
+        _ => die("expiry must look like 08/29"),
+    }
+}
+
+/// Short description of a card for listings: never more than the last four.
+fn card_label(v: &Value) -> String {
+    let c = &v["meta"]["card"];
+    let g = &v["meta"]["gift"];
+    if c.is_object() {
+        let exp = match (c["exp_month"].as_u64().unwrap_or(0), c["exp_year"].as_u64().unwrap_or(0)) {
+            (0, _) | (_, 0) => String::new(),
+            (m, y) => format!("  exp {m:02}/{:02}", y % 100),
+        };
+        format!("{} ending {}{exp}", s(&c["brand"]), s(&c["last4"]))
+    } else if g.is_object() {
+        let left = v["balance_cents"].as_i64().unwrap_or(0);
+        format!("{} ending {}  {} left", s(&g["merchant"]), s(&g["last4"]), money(left)).trim_start().to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn s(v: &Value) -> &str {
     v.as_str().unwrap_or("")
 }
@@ -470,7 +588,7 @@ fn print_secret_line(v: &Value) {
         v["current_version"],
         flags,
         fmt_ts(v["updated_at"].as_i64().unwrap_or(0)),
-        s(&v["meta"]["username"])
+        if v["meta"]["card"].is_object() || v["meta"]["gift"].is_object() { card_label(v) } else { s(&v["meta"]["username"]).to_string() }
     );
 }
 
@@ -577,6 +695,9 @@ fn main() {
                 if !s(&v["meta"]["notes"]).is_empty() {
                     println!("notes:    {}", s(&v["meta"]["notes"]));
                 }
+                if !card_label(&v).is_empty() {
+                    println!("card:     {}", card_label(&v));
+                }
                 println!("driver:   {}", if v["has_driver"].as_bool().unwrap_or(false) { "configured" } else { "none" });
                 println!("\nversion  state     created            by");
                 for x in v["versions"].as_array().into_iter().flatten() {
@@ -602,6 +723,51 @@ fn main() {
             let v = check(c.post("/v1/secrets/create", &body));
             println!("created {} (v{}){}", s(&v["path"]), v["current_version"], if value.is_none() { ", value generated in vault" } else { "" });
         }
+        Cmd::Card { cmd: CardCmd::New { path, title, holder, exp, zip, notes } } => {
+            let (exp_month, exp_year) = exp.as_deref().map(parse_expiry).unwrap_or((0, 0));
+            let number = Zeroizing::new(prompt_secret("Card number: ").replace([' ', '-'], ""));
+            let cvv = Zeroizing::new(prompt_secret("Security code (Enter to skip): ").trim().to_string());
+            let value = Zeroizing::new(json!({"number": number.as_str(), "cvv": cvv.as_str()}).to_string());
+            let body = json!({"path": path, "kind": "card", "value": value.as_str(), "meta": {
+                "title": title, "notes": notes,
+                "card": {"exp_month": exp_month, "exp_year": exp_year, "holder": holder, "zip": zip}}});
+            let v = check(c.post("/v1/secrets/create", &body));
+            println!("saved {}: {}", s(&v["path"]), card_label(&v));
+        }
+        Cmd::Gift { cmd } => match cmd {
+            GiftCmd::New { path, title, merchant, balance, notes } => {
+                let initial = if balance.trim() == "0" { 0 } else { parse_money(&balance) };
+                let number = Zeroizing::new(prompt_secret("Gift card number: ").replace(' ', ""));
+                let pin = Zeroizing::new(prompt_secret("PIN (Enter to skip): ").trim().to_string());
+                let value = Zeroizing::new(json!({"number": number.as_str(), "pin": pin.as_str()}).to_string());
+                let body = json!({"path": path, "kind": "gift_card", "value": value.as_str(), "meta": {
+                    "title": title, "notes": notes, "gift": {"merchant": merchant, "initial_cents": initial}}});
+                let v = check(c.post("/v1/secrets/create", &body));
+                println!("saved {}: {}", s(&v["path"]), card_label(&v));
+            }
+            GiftCmd::Spend { path, amount, note } => {
+                let v = check(c.post("/v1/secrets/ledger", &json!({"path": path, "cents": -parse_money(&amount), "note": note})));
+                println!("recorded; {} left on {path}", money(v["balance_cents"].as_i64().unwrap_or(0)));
+            }
+            GiftCmd::Add { path, amount, note } => {
+                let v = check(c.post("/v1/secrets/ledger", &json!({"path": path, "cents": parse_money(&amount), "note": note})));
+                println!("recorded; {} left on {path}", money(v["balance_cents"].as_i64().unwrap_or(0)));
+            }
+            GiftCmd::Balance { path } => {
+                let v = check(c.get_secret(&path));
+                if raw {
+                    out(&json!({"path": v["path"], "balance_cents": v["balance_cents"], "gift": v["meta"]["gift"]}));
+                } else if !v["meta"]["gift"].is_object() {
+                    die("that item is not a gift card");
+                } else {
+                    println!("{}", card_label(&v));
+                    println!("started with {}", money(v["meta"]["gift"]["initial_cents"].as_i64().unwrap_or(0)));
+                    for e in v["meta"]["gift"]["ledger"].as_array().into_iter().flatten() {
+                        println!("{}  {:>10}  {}  ({})", fmt_ts(e["at"].as_i64().unwrap_or(0)), money(e["cents"].as_i64().unwrap_or(0)), s(&e["note"]), s(&e["by"]));
+                    }
+                }
+            }
+        },
         Cmd::Set { path, stdin } => {
             let value = if stdin { read_stdin_value() } else { prompt_secret("New value: ") };
             let v = check(c.post("/v1/secrets/update", &json!({"path": path, "value": value.as_str()})));
@@ -826,6 +992,16 @@ mod tests {
     #[test]
     fn url_encoding() {
         assert_eq!(urlencode("infra/pve/root"), "infra/pve/root");
+        assert_eq!(parse_money("12.34"), 1234);
+        assert_eq!(parse_money("$1,250"), 125000);
+        assert_eq!(parse_money("0.5"), 50);
+        assert_eq!(money(-1234), "-$12.34");
+        assert_eq!(parse_expiry("08/29"), (8, 2029));
+        assert_eq!(parse_expiry("12/2031"), (12, 2031));
+        let card = json!({"meta": {"card": {"brand": "Visa", "last4": "1111", "exp_month": 8, "exp_year": 2029}}});
+        assert_eq!(card_label(&card), "Visa ending 1111  exp 08/29");
+        let gift = json!({"balance_cents": 3766, "meta": {"gift": {"merchant": "Bookshop", "last4": "XYZ9"}}});
+        assert_eq!(card_label(&gift), "Bookshop ending XYZ9  $37.66 left");
         assert_eq!(urlencode("a b&c=d#e"), "a%20b%26c%3Dd%23e");
     }
 }

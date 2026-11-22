@@ -22,7 +22,7 @@ fn tools() -> Value {
         },
         {
             "name": "secret_list",
-            "description": "List secrets this agent may see (path, kind, version, metadata). Never returns secret values.",
+            "description": "List secrets this agent may see (path, kind, version, metadata). Never returns secret values. Payment cards (kind card) show brand, last four digits and expiry; gift cards (kind gift_card) show the store, last four and balance_cents. Card numbers, security codes and PINs are never returned, and cards can only be added by a person.",
             "inputSchema": {"type": "object", "properties": {"prefix": {"type": "string", "description": "Optional path prefix, e.g. home-lab/"}}}
         },
         {
@@ -90,6 +90,16 @@ fn tools() -> Value {
             "name": "secret_restore",
             "description": "Make an earlier version of a secret current again, for when a new password did not take on the real system. Recorded as a new version. The value is not returned. Version numbers come from secret_get.",
             "inputSchema": {"type": "object", "properties": {"path": path, "version": {"type": "integer"}}, "required": ["path", "version"]}
+        },
+        {
+            "name": "gift_card_record",
+            "description": "Record money spent from, or added to, a gift card so its balance stays right. Returns the card with the new balance_cents. Does not move money and never reveals the card number. Fails if the spend is more than what is left.",
+            "inputSchema": {"type": "object", "properties": {
+                "path": path,
+                "direction": {"type": "string", "enum": ["spend", "add"]},
+                "amount_cents": {"type": "integer", "minimum": 1, "description": "Amount in cents, always positive: 1234 means 12.34"},
+                "note": {"type": "string", "description": "What it was for, one short line"}
+            }, "required": ["path", "direction", "amount_cents"]}
         },
         {
             "name": "secret_move",
@@ -209,6 +219,16 @@ fn call(c: &Client, name: &str, args: &Value) -> Result<Value, ApiError> {
         )
         .map_err(|m| ApiError { status: 400, message: m }),
         "secret_restore" => c.post("/v1/secrets/restore", &json!({"path": arg(args, "path")?, "version": args["version"].as_i64().ok_or_else(|| ApiError { status: 400, message: "missing integer argument `version`".into() })?})),
+        "gift_card_record" => {
+            let bad = |m: &str| ApiError { status: 400, message: m.into() };
+            let cents = args["amount_cents"].as_i64().filter(|n| *n > 0).ok_or_else(|| bad("`amount_cents` must be a positive integer"))?;
+            let signed = match args["direction"].as_str() {
+                Some("spend") => -cents,
+                Some("add") => cents,
+                _ => return Err(bad("`direction` must be spend or add")),
+            };
+            c.post("/v1/secrets/ledger", &json!({"path": arg(args, "path")?, "cents": signed, "note": args["note"].as_str().unwrap_or("")}))
+        }
         "secret_move" => c.post("/v1/secrets/move", &json!({"path": arg(args, "path")?, "new_path": arg(args, "new_path")?})),
         "folder_list" => c.get("/v1/folders"),
         "folder_create" => c.post("/v1/folders/create", &json!({"path": arg(args, "path")?})),

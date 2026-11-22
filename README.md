@@ -222,9 +222,34 @@ every vault that trusts its key. Protect that account, or sign releases
 yourself with a key that needs a human approval per signature and trust
 only that key in `/etc/jaword/release_signers`.
 
+## Cards and gift cards
+
+Payment cards and gift cards are items like any other, with two differences.
+
+- The number, security code and PIN are the sealed value. What can be seen
+  without revealing (brand, last four digits, expiry, balance) is worked out
+  by the vault from the number, so a client cannot mislabel a card.
+- A gift card keeps a ledger. The balance is the starting amount plus every
+  entry, and an agent that may edit details can record spending without ever
+  seeing the number. The ledger is bookkeeping: it does not move money or
+  check the balance with the store.
+
+```bash
+jaword card new personal/cards/everyday --title "Everyday Visa" --exp 08/29
+jaword gift new personal/gift/bookshop --merchant Bookshop --balance 50
+jaword gift spend personal/gift/bookshop 12.34 --note "two paperbacks"
+jaword gift balance personal/gift/bookshop
+```
+
+Numbers are typed at a hidden prompt, never passed as arguments. Over MCP,
+agents get `gift_card_record`; there is no tool that adds or reveals a card.
+Card numbers cannot be generated or rotated. Having an agent pay with a
+stored card needs a browser extension that fills the page after a human
+approves, which is not built yet.
+
 ## Not built yet
 
-Browser extension, mobile apps, passkey login, auto-unseal, built-in drivers
+Browser extension (including approved card fill for agents), mobile apps, passkey login, auto-unseal, built-in drivers
 for specific APIs (Proxmox, Gitea, Cloudflare), Windows service packaging
 (the CLI already builds for Windows; the server's signal handling is
 Unix-only).

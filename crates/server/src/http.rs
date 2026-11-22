@@ -258,6 +258,15 @@ struct GenerateReq {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LedgerReq {
+    path: String,
+    /// Negative for money spent, positive for money added.
+    cents: i64,
+    #[serde(default)]
+    note: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PathReq {
     path: String,
 }
@@ -491,6 +500,11 @@ async fn reveal(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Jso
     Ok(Json(json!({"path": r.path, "value": v.as_str()})))
 }
 
+async fn ledger(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<LedgerReq>) -> Res {
+    let a = actor(&app, &h, addr.ip())?;
+    ok(app.vault.ledger_add(&a, &r.path, r.cents, &r.note)?)
+}
+
 async fn delete(State(app): S, ConnectInfo(addr): Ip, h: HeaderMap, Json(r): Json<PathReq>) -> Res {
     let a = actor(&app, &h, addr.ip())?;
     app.vault.delete(&a, &r.path)?;
@@ -669,6 +683,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/v1/secrets/driver", post(driver))
         .route("/v1/secrets/move", post(move_secret))
         .route("/v1/secrets/restore", post(restore))
+        .route("/v1/secrets/ledger", post(ledger))
         .route("/v1/rotation/prepare", post(rotation_prepare))
         .route("/v1/rotation/trust", post(rotation_trust))
         .route("/v1/rotation/test", post(rotation_test))

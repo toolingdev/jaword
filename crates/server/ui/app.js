@@ -243,6 +243,8 @@ function palette() {
   if (!state.me || document.querySelector("dialog.palette")) return;
   const commands = [
     ["New item", () => secretDialog(null, vaultReload || (() => go("secrets")))],
+    ["New payment card", () => cardDialog("card", null, vaultReload || (() => go("secrets")))],
+    ["New gift card", () => cardDialog("gift_card", null, vaultReload || (() => go("secrets")))],
     ["New folder", () => folderDialog(null, vaultReload || (() => go("secrets")))],
     ["Import from another password manager", () => importDialog(vaultReload || (() => go("secrets")))],
     ["Show passwords overdue for a change", () => { state.onlyStale = true; state.folder = ""; go("secrets"); }],
@@ -257,7 +259,7 @@ function palette() {
   function draw() {
     const q = input.value.trim().toLowerCase();
     const items = state.secrets.filter((s) => !q || itemName(s).toLowerCase().includes(q) || s.path.includes(q) || s.meta.url.toLowerCase().includes(q) || s.meta.username.toLowerCase().includes(q) || s.meta.tags.some((t) => t.toLowerCase().includes(q)))
-      .slice(0, 8).map((s) => ({ label: itemName(s), side: [s.meta.username, folderLabel(folderOf(s.path))].filter(Boolean).join("   "), run: () => { state.selected = s.path; state.folder = ""; state.onlyStale = false; go("secrets"); } }));
+      .slice(0, 8).map((s) => ({ label: itemName(s), side: [isCardish(s) ? cardSummary(s) : s.meta.username, folderLabel(folderOf(s.path))].filter(Boolean).join("   "), run: () => { state.selected = s.path; state.folder = ""; state.onlyStale = false; go("secrets"); } }));
     const cmds = commands.filter(([l]) => !q || l.toLowerCase().includes(q)).map(([label, run]) => ({ label, run, cmd: true }));
     rows = q ? [...items, ...cmds] : [...cmds, ...items];
     at = Math.min(at, Math.max(0, rows.length - 1));
@@ -316,6 +318,7 @@ function folderPicker(selected, opts) {
 }
 
 function ageCell(s) {
+  if (isCardish(s)) return gaugeCell(s);
   if (!rotates(s)) return h("span", { class: "hint" }, "—");
   const days = daysSince(s.changed_at);
   const lit = Math.max(1, Math.ceil((Math.min(days, STALE_DAYS) / STALE_DAYS) * 8));
@@ -394,12 +397,12 @@ async function viewSecrets(main) {
         ideas.length > 0 && h("div", { class: "row" }, h("span", {}, "Start with a folder:"), ideas.map(starter), h("button", { class: "link", onclick: () => folderDialog(null, reload) }, "or name your own"))));
     }
     tableEl.replaceChildren(title, h("table", { class: "grid" },
-      h("thead", {}, h("tr", {}, h("th", {}, sorter("name", "Name")), h("th", { class: "us" }, "Username"), h("th", {}, sorter("age", "Last changed")), h("th", {}, "Rotation"), h("th", { class: "ver" }, "Ver"))),
+      h("thead", {}, h("tr", {}, h("th", {}, sorter("name", "Name")), h("th", { class: "us" }, "Account"), h("th", {}, sorter("age", "Last changed")), h("th", {}, "Rotation"), h("th", { class: "ver" }, "Ver"))),
       h("tbody", {}, rows.map((s) => h("tr", { class: state.selected === s.path ? "on" : null, tabindex: "0",
         onclick: () => { state.selected = s.path; renderTable(); renderDetail(); },
         onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); state.selected = s.path; renderTable(); renderDetail(); } } },
         h("td", { class: "nm" }, itemName(s), !state.folder && folderOf(s.path) && h("small", {}, folderLabel(folderOf(s.path)))),
-        h("td", { class: "us" }, s.meta.username),
+        h("td", { class: "us" }, isCardish(s) ? cardSummary(s) : s.meta.username),
         h("td", {}, ageCell(s)),
         h("td", { class: "rot" + (s.has_driver ? " auto" : "") }, s.pending_rotation ? "Pending" : s.has_driver ? (s.rotate_every_days ? every(s.rotate_every_days).replace(/^e/, "E") : "On request") : rotates(s) ? "By hand" : "—"),
         h("td", { class: "ver" }, s.current_version))))));
@@ -410,7 +413,7 @@ async function viewSecrets(main) {
     let d;
     try { d = await api("GET", "/v1/secrets/get?path=" + encodeURIComponent(state.selected)); }
     catch (e) { state.selected = null; return fail(e); }
-    detailEl.replaceChildren(secretPanel(d, reload));
+    detailEl.replaceChildren(isCardish(d) ? cardPanel(d, reload) : secretPanel(d, reload));
   }
 
   function render() { renderNotice(); renderTree(); renderTable(); }
@@ -499,6 +502,288 @@ function secretPanel(d, reload) {
         h("button", { class: "link", onclick: () => reveal(v.version) }, "Show"),
         v.state !== "pending" && h("button", { class: "link", title: "Make this version the current one again", onclick: () => confirm(`Go back to version ${v.version}? It becomes the current password again; nothing is lost.`) && act("/v1/secrets/restore", { path: d.path, version: v.version }, `Version ${v.version} is current again`) }, "Use again"))))),
     h("div", { class: "row end" }, h("button", { class: "link danger", onclick: () => confirm(`Delete ${itemName(d)}?`) && act("/v1/secrets/delete", { path: d.path }, "Deleted") }, "Delete")));
+}
+
+// ---- cards and gift cards ------------------------------------------------
+// The number, security code and PIN are the item's sealed value. Everything
+// shown without revealing (brand, last four, expiry, balance) is metadata the
+// vault worked out itself.
+const isCard = (s) => s.kind === "card";
+const isGift = (s) => s.kind === "gift_card";
+const isCardish = (s) => isCard(s) || isGift(s);
+const usd = (cents) => (cents < 0 ? "−" : "") + "$" + Math.floor(Math.abs(cents) / 100).toLocaleString("en-US") + "." + p2(Math.abs(cents) % 100);
+function parseMoney(text) {
+  const t = text.trim().replace(/^\$/, "").replace(/,/g, "");
+  if (!/^\d{1,8}(\.\d{1,2})?$/.test(t)) return null;
+  const [whole, frac = ""] = t.split(".");
+  return Number(whole) * 100 + Number((frac + "00").slice(0, 2));
+}
+function parseExpiry(text) {
+  const m = /^\s*(\d{1,2})\s*\/\s*(\d{2}|\d{4})\s*$/.exec(text);
+  if (!m) return null;
+  const month = Number(m[1]), year = Number(m[2]) < 100 ? 2000 + Number(m[2]) : Number(m[2]);
+  return month >= 1 && month <= 12 ? { month, year } : null;
+}
+const expiryText = (c) => (c && c.exp_month && c.exp_year ? `${p2(c.exp_month)}/${p2(c.exp_year % 100)}` : "");
+// Whole months of use left; negative once the card has expired.
+function monthsLeft(c) {
+  if (!c || !c.exp_month || !c.exp_year) return null;
+  const now = new Date();
+  return (c.exp_year - now.getFullYear()) * 12 + (c.exp_month - (now.getMonth() + 1));
+}
+const expiryGrade = (months) => (months < 0 ? "red" : months <= 2 ? "amber" : "green");
+function cardSummary(s) {
+  if (isCard(s)) { const c = s.meta.card || {}; return `${c.brand || "Card"} ending ${c.last4 || "····"}`; }
+  const g = s.meta.gift || {};
+  return [g.merchant, g.last4 && "ending " + g.last4].filter(Boolean).join(" ");
+}
+// Money ever put on a gift card: what it started with plus every top-up.
+const giftLoaded = (g) => (g.initial_cents || 0) + (g.ledger || []).reduce((sum, e) => sum + Math.max(0, e.cents), 0);
+const giftGrade = (left, loaded) => (left <= 0 ? "red" : loaded > 0 && left / loaded < 0.25 ? "amber" : "green");
+function luhnOk(digits) {
+  let sum = 0;
+  [...digits].reverse().forEach((ch, i) => { let n = Number(ch); if (i % 2) { n *= 2; if (n > 9) n -= 9; } sum += n; });
+  return sum % 10 === 0;
+}
+const groupDigits = (n) => (/^3[47]\d{13}$/.test(n) ? [n.slice(0, 4), n.slice(4, 10), n.slice(10)] : n.match(/.{1,4}/g) || []).join(" ");
+
+// A fuel gauge: how much life or money is left, where passwords show age.
+function gaugeCell(s) {
+  const gauge = (grade, lit, text, title) => h("div", { class: "age " + grade, title },
+    h("span", { class: "lights", "aria-hidden": "true" }, Array.from({ length: 8 }, (_, i) => h("i", { class: i < lit ? "lit" : null }))),
+    h("span", {}, text));
+  if (isCard(s)) {
+    const months = monthsLeft(s.meta.card);
+    if (months === null) return h("span", { class: "hint" }, "—");
+    if (months < 0) return gauge("red", 8, "Expired " + expiryText(s.meta.card), "This card has expired");
+    return gauge(expiryGrade(months), Math.max(1, Math.min(8, Math.ceil((months + 1) / 6))), "Expires " + expiryText(s.meta.card), months === 0 ? "Expires this month" : `${months} ${months === 1 ? "month" : "months"} left`);
+  }
+  const g = s.meta.gift || {}, left = s.balance_cents || 0, loaded = giftLoaded(g);
+  const lit = left <= 0 ? 8 : Math.max(1, Math.min(8, Math.ceil((left / Math.max(loaded, left)) * 8)));
+  return gauge(giftGrade(left, loaded), lit, left <= 0 ? "Empty" : usd(left) + " left", `${usd(left)} of ${usd(loaded)} left`);
+}
+
+function cardPanel(d, reload) {
+  const gift = isGift(d), m = d.meta, info = (gift ? m.gift : m.card) || {};
+  const codeName = gift ? "PIN" : "security code";
+  const numMask = "•••• •••• " + (info.last4 || "••••");
+  const num = h("div", { class: "val" }, numMask);
+  const code = h("div", { class: "val" }, "•••");
+  const note = h("div", { class: "hint under" });
+  let shown = false, hideTimer, tick;
+  async function fetchCard(version) {
+    const raw = (await api("POST", "/v1/secrets/reveal", { path: d.path, version: version || null })).value;
+    try { const v = JSON.parse(raw); return { number: String(v.number || ""), code: String(v.cvv || v.pin || "") }; } catch (_) { return { number: raw, code: "" }; }
+  }
+  const eye = iconButton("eyeClosed", "Show card number and " + codeName, () => (shown ? hide() : reveal()));
+  const copyNum = iconButton("copy", "Copy card number", () => copy(copyNum, "number", "Card number copied. Clipboard clears in 30 seconds"));
+  const copyCode = iconButton("copy", "Copy " + codeName, () => copy(copyCode, "code", `${gift ? "PIN" : "Security code"} copied. Clipboard clears in 30 seconds`));
+  const numPlate = h("div", { class: "plate" }, num, h("div", { class: "tools" }, eye, copyNum));
+  const codePlate = h("div", { class: "plate sub" }, h("span", { class: "lbl" }, gift ? "PIN" : "Security code"), code, h("div", { class: "tools" }, copyCode));
+  function hide() {
+    clearTimeout(hideTimer); clearInterval(tick); shown = false;
+    num.textContent = numMask; code.textContent = "•••";
+    numPlate.className = "plate"; codePlate.className = "plate sub"; note.textContent = ""; eye.setIcon("eyeClosed", "Show card number and " + codeName);
+  }
+  async function reveal(version) {
+    try {
+      const v = await fetchCard(version);
+      paint(num, gift ? v.number : groupDigits(v.number));
+      if (v.code) paint(code, v.code); else code.textContent = "none saved";
+      shown = true; numPlate.className = "plate shown"; codePlate.className = "plate sub shown"; eye.setIcon("eyeOpen", "Hide card number and " + codeName);
+      let left = REVEAL_SECONDS;
+      const label = version ? `v${version}, hides in ` : "Hides in ";
+      note.textContent = `${label}${left}s`;
+      clearTimeout(hideTimer); clearInterval(tick);
+      tick = setInterval(() => { left -= 1; note.textContent = `${label}${left}s`; }, 1000);
+      hideTimer = setTimeout(hide, REVEAL_SECONDS * 1000);
+    } catch (e) { fail(e); }
+  }
+  async function copy(button, field, okMsg) {
+    try {
+      let v;
+      const got = await copyWith(button, async () => { v = (await fetchCard())[field]; if (!v) throw new Error("empty"); return v; }, okMsg);
+      if (got) setTimeout(async () => { try { if (await navigator.clipboard.readText() === v) await navigator.clipboard.writeText(""); } catch (_) { /* tab not focused */ } }, 30000);
+    } catch (e) { fail(e); }
+  }
+  async function act(path, body, okMsg) {
+    try { await api("POST", path, body); toast(okMsg); reload(); } catch (e) { fail(e); }
+  }
+  const months = gift ? null : monthsLeft(info);
+  const left = d.balance_cents || 0, loaded = gift ? giftLoaded(info) : 0;
+  const grade = gift ? giftGrade(left, loaded) : months === null ? "green" : expiryGrade(months);
+  const statusText = gift ? (left <= 0 ? "Empty" : usd(left) + " left")
+    : months === null ? "No expiry saved" : months < 0 ? "Expired " + expiryText(info) : "Expires " + expiryText(info);
+  const ledger = gift ? [...(info.ledger || [])].reverse() : [];
+  const earlier = d.versions.filter((v) => v.state !== "current");
+  return h("div", { class: "insp" },
+    h("div", { class: "top" },
+      h("div", { class: "grow" }, h("h3", {}, m.title || pretty(leafOf(d.path))), h("div", { class: "where" }, folderLabel(folderOf(d.path)))),
+      h("div", { class: "status" }, lamp(grade), statusText)),
+    numPlate, codePlate, note,
+    h("dl", { class: "kv" },
+      !gift && h("dt", {}, "Card"), !gift && h("dd", {}, cardSummary(d)),
+      gift && info.merchant && h("dt", {}, "Store"), gift && info.merchant && h("dd", {}, info.merchant),
+      gift && h("dt", {}, "Balance"), gift && h("dd", {}, `${usd(left)} of ${usd(loaded)}`),
+      !gift && info.holder && h("dt", {}, "Name"), !gift && info.holder && h("dd", {}, info.holder),
+      !gift && info.zip && h("dt", {}, "ZIP"), !gift && info.zip && h("dd", { class: "mono" }, info.zip),
+      m.notes && h("dt", {}, "Notes"), m.notes && h("dd", {}, m.notes),
+      h("dt", {}, "Address"), h("dd", { class: "mono", title: "What agents and access rules use to refer to this item" }, d.path)),
+    h("div", { class: "row" },
+      gift && h("button", { class: "btn primary", onclick: () => ledgerDialog(d, -1, reload) }, "Record spending"),
+      gift && h("button", { class: "btn", onclick: () => ledgerDialog(d, 1, reload) }, "Add money"),
+      h("button", { class: "btn", onclick: () => cardDialog(d.kind, d, reload, { replace: true }) }, gift ? "Replace number" : "Replace card"),
+      h("button", { class: "btn", onclick: () => cardDialog(d.kind, d, reload) }, "Edit"),
+      h("button", { class: "btn", onclick: () => moveDialog(d, reload) }, "Move")),
+    gift && h("div", { class: "cap sep" }, "Spending"),
+    gift && h("ul", { class: "timeline ledger" },
+      ledger.map((e) => h("li", { class: e.cents > 0 ? "add" : "spend" },
+        h("span", {}, short(e.at)), h("span", { class: "amt" }, (e.cents > 0 ? "+" : "") + usd(e.cents)),
+        e.note && h("span", { class: "what" }, e.note), h("span", { class: "acts" }, who(e.by)))),
+      h("li", { class: "start" }, h("span", {}, short(d.created_at)), h("span", { class: "amt" }, usd(info.initial_cents || 0)), h("span", { class: "what" }, "Starting balance"))),
+    earlier.length > 0 && h("div", { class: "cap sep" }, gift ? "Earlier numbers" : "Earlier cards"),
+    earlier.length > 0 && h("ul", { class: "timeline" }, earlier.map((v) => h("li", { class: v.state, title: v.state },
+      h("span", { class: "v" }, "v" + v.version), h("span", {}, short(v.created_at)), h("span", {}, who(v.created_by)),
+      h("span", { class: "acts" },
+        h("button", { class: "link", onclick: () => reveal(v.version) }, "Show"),
+        h("button", { class: "link", title: "Make this the current card again", onclick: () => confirm(`Go back to version ${v.version}? It becomes the current card again; nothing is lost.`) && act("/v1/secrets/restore", { path: d.path, version: v.version }, `Version ${v.version} is current again`) }, "Use again"))))),
+    h("div", { class: "row end" }, h("button", { class: "link danger", onclick: () => confirm(`Delete ${itemName(d)}?`) && act("/v1/secrets/delete", { path: d.path }, "Deleted") }, "Delete")));
+}
+
+// One dialog, three jobs: add a card, edit its details, or put a new number
+// on an existing item (the old number stays in its history).
+function cardDialog(kind, existing, done, opts) {
+  const o = opts || {};
+  const gift = kind === "gift_card";
+  const m = existing ? existing.meta : { title: o.title || "", username: "", url: "", notes: "", tags: [] };
+  const info = (existing && (gift ? m.gift : m.card)) || {};
+  const withNumber = !existing || o.replace, withDetails = !o.replace;
+  const text = (attrs) => h("input", Object.assign({ type: "text", autocomplete: "off", spellcheck: "false" }, attrs));
+  const f = {
+    title: text({ class: "big", placeholder: gift ? "Name, like Bookshop gift card" : "Name, like Everyday Visa", value: m.title || "", maxlength: "200", required: !existing, autofocus: withDetails, "aria-label": "Name" }),
+    number: text({ class: "mono", placeholder: gift ? "Gift card number" : "Card number", inputmode: gift ? "text" : "numeric", maxlength: "80", autofocus: !withDetails, "aria-label": gift ? "Gift card number" : "Card number" }),
+    code: text({ class: "mono", placeholder: gift ? "PIN, if it has one" : "Security code", inputmode: gift ? "text" : "numeric", maxlength: gift ? "32" : "4", "aria-label": gift ? "PIN" : "Security code" }),
+    exp: text({ class: "mono", placeholder: "Expires MM/YY", inputmode: "numeric", maxlength: "7", value: existing && !o.replace ? expiryText(info) : "", "aria-label": "Expiry date, month and year" }),
+    holder: text({ placeholder: "Name on the card", value: info.holder || "", maxlength: "100", "aria-label": "Name on the card" }),
+    zip: text({ placeholder: "Billing ZIP", value: info.zip || "", maxlength: "16", "aria-label": "Billing ZIP or postcode" }),
+    merchant: text({ placeholder: "Store, like Target", value: info.merchant || "", maxlength: "100", "aria-label": "Store" }),
+    balance: text({ class: "mono", placeholder: existing ? "Starting balance" : "Balance today, like 50.00", inputmode: "decimal", value: existing ? ((info.initial_cents || 0) / 100).toFixed(2) : "", "aria-label": existing ? "Starting balance" : "Balance today" }),
+    notes: h("textarea", { placeholder: "Notes", "aria-label": "Notes" }, m.notes || ""),
+  };
+  const kindSel = h("select", { "aria-label": "Kind" }, [["card", "Payment card"], ["gift_card", "Gift card"], ["", "Something else…"]].map(([k, l]) => h("option", { value: k, selected: k === kind }, l)));
+  const folder = folderPicker(o.folder !== undefined ? o.folder : state.folder || "");
+  const err = h("div", { class: "error" });
+  const warn = h("div", { class: "hint" });
+  const where = h("span", { class: "hint" });
+  const target = () => { const dir = folder.value(); return (dir ? dir + "/" : "") + (slug(f.title.value) || "card"); };
+  const cleanNumber = () => (gift ? f.number.value.replace(/\s+/g, "") : f.number.value.replace(/[\s-]+/g, ""));
+  const sync = () => {
+    if (!existing) where.textContent = "Agents will know it as " + target() + ", never the number";
+    const n = cleanNumber();
+    warn.textContent = !gift && /^\d{12,19}$/.test(n) && !luhnOk(n) ? "That number does not add up the way card numbers do. Check it for a typo." : "";
+  };
+  [f.title, f.number, folder.el].forEach((el) => el.addEventListener("input", sync));
+  folder.el.addEventListener("change", sync);
+  kindSel.addEventListener("change", () => {
+    dlg.close();
+    if (kindSel.value) cardDialog(kindSel.value, null, done, { title: f.title.value, folder: folder.isNew() ? "" : folder.raw() });
+    else secretDialog(null, done);
+  });
+  const dlg = dialog(null,
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = "";
+      const meta = Object.assign({}, m, { title: withDetails ? f.title.value.trim() : m.title, notes: withDetails ? f.notes.value : m.notes });
+      delete meta.policy;
+      if (gift) {
+        const start = f.balance.value.trim() ? parseMoney(f.balance.value) : 0;
+        if (withDetails && start === null) { err.textContent = "Write the balance like 50.00."; return; }
+        meta.gift = Object.assign({}, info, withDetails ? { merchant: f.merchant.value.trim(), initial_cents: start } : {});
+        delete meta.card;
+      } else {
+        const exp = f.exp.value.trim() ? parseExpiry(f.exp.value) : { month: 0, year: 0 };
+        if (!exp) { err.textContent = "Write the expiry like 08/29."; return; }
+        // Replacing with the expiry left blank keeps the one already saved.
+        const keepExp = o.replace && !f.exp.value.trim();
+        meta.card = Object.assign({}, info, keepExp ? {} : { exp_month: exp.month, exp_year: exp.year }, withDetails ? { holder: f.holder.value.trim(), zip: f.zip.value.trim() } : {});
+        delete meta.gift;
+      }
+      const body = existing ? { path: existing.path, meta } : { path: target(), kind, meta };
+      if (withNumber) {
+        const n = cleanNumber(), c = f.code.value.trim();
+        if (gift ? !/^[A-Za-z0-9-]{4,64}$/.test(n) : !/^\d{12,19}$/.test(n)) { err.textContent = gift ? "Enter the gift card number: letters, digits and dashes." : "Enter the card number: 12 to 19 digits."; return; }
+        if (!gift && c && !/^\d{3,4}$/.test(c)) { err.textContent = "The security code is 3 or 4 digits."; return; }
+        body.value = JSON.stringify(gift ? { number: n, pin: c } : { number: n, cvv: c });
+      }
+      try {
+        if (!existing && !folder.valid()) { err.textContent = "Give the new folder a name."; return; }
+        await api("POST", existing ? "/v1/secrets/update" : "/v1/secrets/create", body);
+        if (!existing) state.selected = body.path;
+        dlg.close();
+        toast(o.replace ? "Saved. The old number is in this card's history" : existing ? "Saved" : "Added to the vault");
+        done();
+      } catch (ex) {
+        if (ex.status === 401 || ex.code === "sealed") { dlg.close(); return fail(ex); }
+        err.textContent = ex.status === 409 ? "This folder already has an item with that name."
+          : ex.status === 403 ? "This access token may not save card numbers. Ask an admin for the write permission." : ex.message;
+      }
+    } },
+      h("div", { class: "title" }, h("h3", {}, o.replace ? (gift ? "New number for " : "New card for ") + itemName(existing) : existing ? "Edit " + (gift ? "gift card" : "card") : gift ? "New gift card" : "New card"), !existing && where),
+      withDetails && f.title,
+      withNumber && h("div", { class: "stack" }, f.number),
+      withNumber && !gift && h("div", { class: "two gap" }, f.exp, f.code),
+      withNumber && gift && h("div", { class: "two gap" }, f.code, withDetails ? f.balance : h("span", {})),
+      !withNumber && !gift && h("div", { class: "two gap" }, f.exp, f.zip),
+      !withNumber && gift && h("div", { class: "two gap" }, f.merchant, f.balance),
+      withNumber && withDetails && !gift && h("div", { class: "two gap" }, f.holder, f.zip),
+      withNumber && withDetails && gift && h("div", { class: "stack" }, f.merchant),
+      !withNumber && !gift && h("div", { class: "stack" }, f.holder),
+      !existing && h("div", { class: "two gap" }, h("div", {}, h("label", {}, "Folder"), folder.el), h("div", {}, h("label", {}, "Kind"), kindSel)),
+      withDetails && h("div", { class: "stack" }, f.notes),
+      warn,
+      o.replace && h("p", { class: "hint" }, gift ? "The balance and spending history stay. The current number moves to this card's history." : "Leave the expiry blank to keep the one saved. The current number moves to this card's history."),
+      err,
+      h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save changes" : "Add to vault"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
+        h("span", { class: "hint" }, SAVE_HINT))));
+  quickSave(dlg);
+  sync();
+  dlg.showModal();
+}
+
+// Money out of, or onto, a gift card. This keeps the books; it moves no money.
+function ledgerDialog(d, sign, done) {
+  const left = d.balance_cents || 0;
+  const amount = h("input", { class: "big mono", type: "text", inputmode: "decimal", placeholder: "0.00", autocomplete: "off", autofocus: true, required: true, "aria-label": sign < 0 ? "Amount spent" : "Amount added" });
+  const noteIn = h("input", { type: "text", placeholder: sign < 0 ? "What was it for?" : "Where did it come from?", autocomplete: "off", maxlength: "200", "aria-label": "Note" });
+  const err = h("div", { class: "error" });
+  const after = h("p", { class: "hint" }, `${usd(left)} on the card now.`);
+  amount.addEventListener("input", () => {
+    const c = parseMoney(amount.value);
+    after.textContent = c ? `${usd(left)} on the card now, ${usd(Math.max(0, left + sign * c))} after this.` : `${usd(left)} on the card now.`;
+  });
+  const dlg = dialog(null,
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = "";
+      const c = parseMoney(amount.value);
+      if (!c) { err.textContent = "Write the amount like 12.34."; return; }
+      if (sign < 0 && c > left) { err.textContent = `Only ${usd(left)} is left on this card.`; return; }
+      try {
+        const r = await api("POST", "/v1/secrets/ledger", { path: d.path, cents: sign * c, note: noteIn.value.trim() });
+        dlg.close(); toast(`${usd(r.balance_cents || 0)} left on ${itemName(d)}`); done();
+      } catch (ex) {
+        if (ex.status === 401 || ex.code === "sealed") { dlg.close(); return fail(ex); }
+        err.textContent = ex.status === 403 ? "This access token may not change this card's details." : ex.message;
+      }
+    } },
+      h("div", { class: "title" }, h("h3", {}, (sign < 0 ? "Spent from " : "Added to ") + itemName(d))),
+      amount,
+      h("div", { class: "stack" }, noteIn),
+      after, err,
+      h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, sign < 0 ? "Record spending" : "Add money"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
+        h("span", { class: "hint" }, SAVE_HINT))));
+  quickSave(dlg);
+  dlg.showModal();
 }
 
 // ---- password generator -------------------------------------------------
@@ -641,7 +926,7 @@ const SAVE_HINT = (MAC ? "⌘" : "Ctrl") + " Enter to save";
 
 function secretDialog(existing, done) {
   const m = existing ? existing.meta : { title: "", username: "", url: "", notes: "", tags: [] };
-  const kinds = [["password", "Login or password"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]];
+  const kinds = [["password", "Login or password"], ["card", "Payment card"], ["gift_card", "Gift card"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]];
   const f = {
     title: h("input", { class: "big", type: "text", placeholder: "Name, like GitHub or Proxmox root", value: m.title || "", autocomplete: "off", maxlength: "200", autofocus: true, required: !existing, "aria-label": "Name" }),
     kind: h("select", {}, kinds.map(([k, l]) => h("option", { value: k }, l))),
@@ -671,6 +956,12 @@ function secretDialog(existing, done) {
   };
   [f.title, folder.el].forEach((el) => el.addEventListener("input", sync));
   [folder.el, f.kind].forEach((el) => el.addEventListener("change", sync));
+  // Cards have their own fields: hand over to the card dialog, keeping the name.
+  f.kind.addEventListener("change", () => {
+    if (f.kind.value !== "card" && f.kind.value !== "gift_card") return;
+    dlg.close();
+    cardDialog(f.kind.value, null, done, { title: f.title.value, folder: folder.isNew() ? "" : folder.raw() });
+  });
   const dlg = dialog(null,
     h("form", { onsubmit: async (e) => {
       e.preventDefault(); err.textContent = "";

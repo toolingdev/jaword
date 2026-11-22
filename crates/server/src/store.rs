@@ -23,11 +23,12 @@ use std::sync::{Mutex, MutexGuard, RwLock, TryLockError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
 
+use crate::cards::{self, CardInfo, GiftInfo};
 use crate::drivers::{Driver, RotationSetup};
 
 pub const MAX_VALUE: usize = 16 * 1024;
 pub const MIN_PASSPHRASE: usize = 14;
-const KINDS: &[&str] = &["password", "api_key", "ssh_key", "config", "note"];
+const KINDS: &[&str] = &["password", "api_key", "ssh_key", "config", "note", cards::CARD, cards::GIFT_CARD];
 
 #[derive(Debug)]
 pub enum VErr {
@@ -114,6 +115,71 @@ pub struct Meta {
     /// Generation policy reused on every rotation.
     #[serde(default)]
     pub policy: Option<Policy>,
+    /// Present on payment cards only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardInfo>,
+    /// Present on gift cards only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gift: Option<GiftInfo>,
+}
+
+/// Make card metadata consistent with the item's kind and value. The brand,
+/// last four digits and gift card ledger are the vault's: they come from the
+/// value or from what is already stored, never from the caller.
+fn settle_cards(kind: &str, meta: &mut Meta, old: Option<&Meta>, value: Option<&str>) -> R<()> {
+    let facts = match (cards::is_card_kind(kind), value) {
+        (true, Some(v)) => Some(cards::inspect(kind, v).map_err(|e| VErr::BadRequest(e.into()))?),
+        _ => None,
+    };
+    match kind {
+        cards::CARD => {
+            meta.gift = None;
+            meta.policy = None;
+            let c = meta.card.get_or_insert_with(CardInfo::default);
+            let prev = old.and_then(|m| m.card.as_ref());
+            match (&facts, prev) {
+                (Some(f), _) => {
+                    c.last4 = f.last4.clone();
+                    c.brand = f.brand.clone();
+                }
+                (None, Some(p)) => {
+                    c.last4 = p.last4.clone();
+                    c.brand = p.brand.clone();
+                }
+                (None, None) => return bad("enter the card number"),
+            }
+            cards::validate_card(c).map_err(|e| VErr::BadRequest(e.into()))
+        }
+        cards::GIFT_CARD => {
+            meta.card = None;
+            meta.policy = None;
+            let g = meta.gift.get_or_insert_with(GiftInfo::default);
+            let prev = old.and_then(|m| m.gift.as_ref());
+            g.ledger = prev.map(|p| p.ledger.clone()).unwrap_or_default();
+            match (&facts, prev) {
+                (Some(f), _) => g.last4 = f.last4.clone(),
+                (None, Some(p)) => g.last4 = p.last4.clone(),
+                (None, None) => return bad("enter the gift card number"),
+            }
+            cards::validate_gift(g).map_err(|e| VErr::BadRequest(e.into()))?;
+            if g.balance() < 0 {
+                return bad("starting balance is less than what was already spent");
+            }
+            Ok(())
+        }
+        _ => {
+            meta.card = None;
+            meta.gift = None;
+            Ok(())
+        }
+    }
+}
+
+fn no_cards(kind: &str) -> R<()> {
+    if cards::is_card_kind(kind) {
+        return bad("a card number cannot be generated or rotated; enter the new card details instead");
+    }
+    Ok(())
 }
 
 impl Meta {
@@ -187,6 +253,9 @@ pub struct SecretView {
     pub changed_by: String,
     /// Set when the vault rotates this on its own.
     pub rotate_every_days: Option<u32>,
+    /// Money left on a gift card, in cents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_cents: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -859,6 +928,7 @@ impl Vault {
             current_version: s.current_version,
             created_at: s.created_at,
             updated_at: s.updated_at,
+            balance_cents: meta.gift.as_ref().map(|g| g.balance()),
             meta,
             has_driver: s.driver_blob.is_some(),
             pending_rotation: pending > 0,
@@ -889,11 +959,12 @@ impl Vault {
                 a.require(Cap::Write, path)?;
             }
             if !KINDS.contains(&kind) {
-                return bad("kind must be one of password, api_key, ssh_key, config, note");
+                return bad("kind must be one of password, api_key, ssh_key, config, note, card, gift_card");
             }
             if policy.is_some() {
                 meta.policy = policy;
             }
+            settle_cards(kind, &mut meta, None, value.as_ref().map(|v| v.as_str()))?;
             meta.validate()?;
             let value = match value {
                 Some(v) => v,
@@ -998,6 +1069,17 @@ impl Vault {
                 let mut db = self.db();
                 let tx = db.transaction()?;
                 let s = self.load(&tx, k, path)?;
+                let old: Meta = serde_json::from_slice(&crypto::open(&k.meta, &aad_meta(&s.id), &s.meta_blob)?)?;
+                // A new card number changes the last four digits, so the
+                // metadata follows the value even when only the value was sent.
+                let mut meta = meta.clone();
+                if meta.is_none() && value.is_some() && cards::is_card_kind(&s.kind) {
+                    meta = Some(old.clone());
+                }
+                if let Some(m) = meta.as_mut() {
+                    settle_cards(&s.kind, m, Some(&old), value.as_ref().map(|v| v.as_str()))?;
+                    m.validate()?;
+                }
                 if let Some(m) = &meta {
                     tx.execute(
                         "UPDATE secrets SET meta_blob=?1, updated_at=?2 WHERE id=?3",
@@ -1024,6 +1106,7 @@ impl Vault {
                 let mut db = self.db();
                 let tx = db.transaction()?;
                 let s = self.load(&tx, k, path)?;
+                no_cards(&s.kind)?;
                 let mut meta: Meta = serde_json::from_slice(&crypto::open(&k.meta, &aad_meta(&s.id), &s.meta_blob)?)?;
                 if let Some(p) = policy {
                     meta.policy = Some(p);
@@ -1060,6 +1143,47 @@ impl Vault {
         r
     }
 
+    /// Record money spent from (negative) or added to (positive) a gift card.
+    /// Needs only the right to edit details: the card number stays sealed.
+    pub fn ledger_add(&self, a: &Actor, path: &str, cents: i64, note: &str) -> R<SecretView> {
+        let r = (|| {
+            a.require(Cap::Update, path)?;
+            if cents == 0 || cents.abs() > cards::MAX_CENTS {
+                return bad("amount must be more than zero and under ten million");
+            }
+            if note.len() > 200 || note.chars().any(|c| c.is_control()) {
+                return bad("note must be one line of at most 200 characters");
+            }
+            self.with_keys(|k| {
+                let mut db = self.db();
+                let tx = db.transaction()?;
+                let s = self.load(&tx, k, path)?;
+                if s.kind != cards::GIFT_CARD {
+                    return bad("only gift cards have a balance");
+                }
+                let mut meta: Meta = serde_json::from_slice(&crypto::open(&k.meta, &aad_meta(&s.id), &s.meta_blob)?)?;
+                let g = meta.gift.get_or_insert_with(GiftInfo::default);
+                if g.ledger.len() >= cards::MAX_LEDGER {
+                    return bad("this card's history is full");
+                }
+                let left = g.balance();
+                if left + cents < 0 {
+                    return Err(VErr::BadRequest(format!("only {} left on this card", cards::money(left))));
+                }
+                g.ledger.push(cards::Entry { at: now(), cents, note: note.to_string(), by: a.label() });
+                tx.execute(
+                    "UPDATE secrets SET meta_blob=?1, updated_at=?2 WHERE id=?3",
+                    params![crypto::seal(&k.meta, &aad_meta(&s.id), &serde_json::to_vec(&meta)?)?, now(), s.id],
+                )?;
+                let s = self.load(&tx, k, path)?;
+                let view = self.view(&tx, k, &s)?;
+                tx.commit()?;
+                Ok(view)
+            })
+        })();
+        self.logged(a, if cents < 0 { "card.spend" } else { "card.add" }, path, r)
+    }
+
     /// Make an earlier version current again, for when a new password did
     /// not take on the real system. Recorded as a new version, so history
     /// stays a straight line. Nothing is revealed to the caller.
@@ -1075,6 +1199,16 @@ impl Vault {
                 }
                 let old = read_version(&tx, k, &s.id, version)?;
                 promote_new(&tx, k, &s.id, old.as_bytes(), &a.label())?;
+                if cards::is_card_kind(&s.kind) {
+                    // The restored card may be a different card: keep the label honest.
+                    let mut meta: Meta = serde_json::from_slice(&crypto::open(&k.meta, &aad_meta(&s.id), &s.meta_blob)?)?;
+                    let before = meta.clone();
+                    settle_cards(&s.kind, &mut meta, Some(&before), Some(old.as_str()))?;
+                    tx.execute(
+                        "UPDATE secrets SET meta_blob=?1 WHERE id=?2",
+                        params![crypto::seal(&k.meta, &aad_meta(&s.id), &serde_json::to_vec(&meta)?)?, s.id],
+                    )?;
+                }
                 let s = self.load(&tx, k, path)?;
                 let view = self.view(&tx, k, &s)?;
                 tx.commit()?;
@@ -1319,6 +1453,9 @@ impl Vault {
             self.with_keys(|k| {
                 let db = self.db();
                 let s = self.load(&db, k, path)?;
+                if driver.is_some() {
+                    no_cards(&s.kind)?;
+                }
                 let blob = match &driver {
                     Some(d) => Some(crypto::seal(&k.meta, &aad_driver(&s.id), &serde_json::to_vec(d)?)?),
                     None => None,
@@ -1669,6 +1806,80 @@ mod tests {
         v.seal(&root).unwrap();
         v.unseal(&out.recovery_key).unwrap();
         assert_eq!(v.reveal(&root, "infra/a", None).unwrap().as_str(), "s3cret-value");
+    }
+
+    #[test]
+    fn cards_and_gift_cards() {
+        let (v, root, _) = vault();
+        let val = |s: &str| Some(Zeroizing::new(s.to_string()));
+        let visa = r#"{"number":"4111111111111111","cvv":"123"}"#;
+        let mc = r#"{"number":"5555555555554444","cvv":"321"}"#;
+
+        // The vault derives brand and last four; a lying client is overruled.
+        let lie = Meta {
+            title: "Everyday".into(),
+            card: Some(CardInfo { brand: "Amex".into(), last4: "0000".into(), exp_month: 8, exp_year: 2029, ..Default::default() }),
+            ..Default::default()
+        };
+        let c = v.create(&root, "infra/visa", "card", lie, val(visa), None).unwrap();
+        let info = c.meta.card.unwrap();
+        assert_eq!((info.brand.as_str(), info.last4.as_str(), info.exp_month), ("Visa", "1111", 8));
+        assert!(c.balance_cents.is_none());
+        assert_eq!(v.reveal(&root, "infra/visa", None).unwrap().as_str(), visa);
+
+        // No number, a malformed one, or a generated one: all refused.
+        assert!(matches!(v.create(&root, "infra/none", "card", Meta::default(), None, None), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.create(&root, "infra/junk", "card", Meta::default(), val("4111111111111111"), None), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.generate(&root, "infra/visa", None), Err(VErr::BadRequest(_))));
+        assert_eq!(v.get(&root, "infra/visa").unwrap().secret.current_version, 1);
+
+        // A replacement card updates the label by itself; restoring puts it back.
+        let c = v.update(&root, "infra/visa", None, val(mc)).unwrap();
+        let info = c.meta.card.unwrap();
+        assert_eq!((info.brand.as_str(), info.last4.as_str(), info.exp_year), ("Mastercard", "4444", 2029));
+        let c = v.restore_version(&root, "infra/visa", 1).unwrap();
+        assert_eq!(c.meta.card.unwrap().last4, "1111");
+
+        // Card details do not leak onto ordinary items.
+        let stray = Meta { card: Some(CardInfo::default()), gift: Some(GiftInfo::default()), ..Default::default() };
+        let p = v.create(&root, "infra/pw", "password", stray, None, None).unwrap();
+        assert!(p.meta.card.is_none() && p.meta.gift.is_none());
+
+        // Gift card: balance is the start minus the ledger.
+        let gift = Meta {
+            gift: Some(GiftInfo { merchant: "Bookshop".into(), initial_cents: 5000, ..Default::default() }),
+            ..Default::default()
+        };
+        let g = v.create(&root, "infra/gift", "gift_card", gift, val(r#"{"number":"ABCD-1234-XYZ9","pin":"8842"}"#), None).unwrap();
+        assert_eq!(g.balance_cents, Some(5000));
+        assert_eq!(g.meta.gift.as_ref().unwrap().last4, "XYZ9");
+
+        // An agent that may edit details can record a spend but never see the number.
+        let a = agent(&v, &root, vec![Cap::List, Cap::Update]);
+        let g = v.ledger_add(&a, "infra/gift", -1234, "lunch").unwrap();
+        assert_eq!(g.balance_cents, Some(3766));
+        assert!(matches!(v.reveal(&a, "infra/gift", None), Err(VErr::Forbidden)));
+        assert!(matches!(v.ledger_add(&a, "infra/gift", -9999, ""), Err(VErr::BadRequest(m)) if m.contains("37.66")));
+        assert!(matches!(v.ledger_add(&a, "infra/gift", 0, ""), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.ledger_add(&a, "infra/visa", -100, ""), Err(VErr::BadRequest(_))));
+        let reader = agent(&v, &root, vec![Cap::List]);
+        assert!(matches!(v.ledger_add(&reader, "infra/gift", -100, ""), Err(VErr::Forbidden)));
+        assert_eq!(v.ledger_add(&root, "infra/gift", 2000, "reload").unwrap().balance_cents, Some(5766));
+
+        // Editing details cannot rewrite history or relabel the card.
+        let mut m = v.get(&root, "infra/gift").unwrap().secret.meta;
+        let gi = m.gift.as_mut().unwrap();
+        gi.ledger.clear();
+        gi.last4 = "0000".into();
+        gi.merchant = "Corner Bookshop".into();
+        let g = v.update(&root, "infra/gift", Some(m), None).unwrap();
+        let gi = g.meta.gift.unwrap();
+        assert_eq!((gi.ledger.len(), gi.last4.as_str(), gi.merchant.as_str()), (2, "XYZ9", "Corner Bookshop"));
+        assert_eq!(g.balance_cents, Some(5766));
+        assert_eq!(gi.ledger[0].by, a.label());
+
+        // Old stored metadata (no card fields) still reads, and stays byte-compatible.
+        assert_eq!(serde_json::to_string(&Meta::default()).unwrap().contains("card"), false);
     }
 
     #[test]

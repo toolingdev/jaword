@@ -177,6 +177,22 @@ kbd { font: 500 12.5px var(--mono); color: var(--mute); background: var(--lit); 
 .plate.shown .iconbtn:first-child { color: var(--blue); }
 .iconbtn.done { color: var(--green); }
 .hint.under { min-height: 20px; text-align: right; font: 13px var(--mono); }
+/* Second plate under the card number: security code or PIN. */
+.plate.sub { margin: 0 0 6px; min-height: 44px; padding-top: 4px; padding-bottom: 4px; }
+.plate.sub .lbl { flex: none; color: var(--mute); font-size: 13px; }
+.plate.sub .val { text-align: right; padding-right: 8px; font-size: 15.5px; }
+.plate.sub:not(.shown) .val { letter-spacing: .2em; }
+/* Gift card spending: money out in plain text, money in in green. */
+/* Date, amount and who on one line; what it was for underneath. */
+.ledger li { display: grid; grid-template-columns: 10px auto auto 1fr; align-items: center; gap: 1px 10px; padding: 7px 0; }
+.ledger li::before { margin-left: 2px; }
+.ledger .acts { grid-column: 4; grid-row: 1; justify-self: end; margin: 0; }
+.ledger .what { grid-column: 2 / -1; grid-row: 2; }
+.ledger .amt { min-width: 6.2em; text-align: right; color: var(--text); }
+.ledger li.add .amt { color: var(--green); }
+.ledger li.add::before { background: var(--green); }
+.ledger .what { white-space: normal; color: var(--text); font-family: var(--sans); font-size: 14px; }
+.ledger li.start .what { color: var(--mute); }
 .c-d { color: var(--amber); }
 .c-s { color: var(--blue); }
 .kv { display: grid; grid-template-columns: 86px 1fr; margin: 16px 0 18px; }

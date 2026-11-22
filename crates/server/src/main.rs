@@ -1,6 +1,7 @@
 //! jawordd: the jaword vault server.
 #![forbid(unsafe_code)]
 
+mod cards;
 mod drivers;
 mod http;
 mod rotation;
