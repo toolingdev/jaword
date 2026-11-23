@@ -1,6 +1,6 @@
 [package]
 name = "jawordd"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/toolingdev/jaword"
@@ -10,7 +10,7 @@ axum = "0.8.9"
 hex = "0.4.3"
 hyper = "1"
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "http1", "http2"] }
-jaword-core = { version = "0.2.0", path = "../core" }
+jaword-core = { version = "0.3.0", path = "../core" }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
