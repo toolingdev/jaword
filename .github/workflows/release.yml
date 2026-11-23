@@ -2,6 +2,11 @@ name: release
 
 # Pushing a tag like v0.2.0 builds, signs and publishes a release.
 # The signing key lives only in the JAWORD_RELEASE_KEY repository secret.
+#
+# The Linux binaries are what a vault installs, so they publish as soon as
+# they are built. The Mac binaries are added to the same release afterwards:
+# hosted Mac runners can queue for a long time, and that must not hold up a
+# vault update. If the Mac half fails, rerun the failed jobs.
 on:
   push:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
@@ -13,55 +18,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - suffix: x86_64-linux-musl
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-          - suffix: arm64-darwin
-            os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-musl
+      SUFFIX: x86_64-linux-musl
     steps:
       - uses: actions/checkout@v7
       - name: Tag must match the crate version
-        shell: bash
         run: |
           want="${GITHUB_REF_NAME#v}"
           for f in crates/core/Cargo.toml crates/server/Cargo.toml crates/cli/Cargo.toml; do
             got=$(grep -m1 '^version = ' "$f" | cut -d'"' -f2)
             [ "$got" = "$want" ] || { echo "$f is $got, tag is $want"; exit 1; }
           done
-      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
-      - if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo test --workspace --locked
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target "$TARGET"
       - name: Collect
-        shell: bash
         run: |
           mkdir dist
-          cp target/${{ matrix.target }}/release/jaword  dist/jaword-${{ matrix.suffix }}
-          cp target/${{ matrix.target }}/release/jawordd dist/jawordd-${{ matrix.suffix }}
+          cp "target/$TARGET/release/jaword"  "dist/jaword-$SUFFIX"
+          cp "target/$TARGET/release/jawordd" "dist/jawordd-$SUFFIX"
       - uses: actions/upload-artifact@v7
         with:
-          name: dist-${{ matrix.suffix }}
+          name: dist-linux
           path: dist/*
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: linux
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v8
         with:
+          name: dist-linux
           path: dist
-          pattern: dist-*
-          merge-multiple: true
       - name: Sign
         env:
           JAWORD_RELEASE_KEY: ${{ secrets.JAWORD_RELEASE_KEY }}
@@ -88,3 +83,56 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --verify-tag \
             --notes "Signed release $GITHUB_REF_NAME. The vault verifies the signature before installing."
+
+  mac:
+    runs-on: macos-latest
+    env:
+      TARGET: aarch64-apple-darwin
+      SUFFIX: arm64-darwin
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal --target "$TARGET"
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Collect
+        run: |
+          mkdir dist
+          cp "target/$TARGET/release/jaword"  "dist/jaword-$SUFFIX"
+          cp "target/$TARGET/release/jawordd" "dist/jawordd-$SUFFIX"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-mac
+          path: dist/*
+          if-no-files-found: error
+
+  publish-mac:
+    needs: [mac, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist-mac
+          path: dist
+      - name: Sign and add to the release
+        env:
+          JAWORD_RELEASE_KEY: ${{ secrets.JAWORD_RELEASE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          [ -n "$JAWORD_RELEASE_KEY" ] || { echo "JAWORD_RELEASE_KEY secret is not set"; exit 1; }
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$JAWORD_RELEASE_KEY" > "$key"
+          chmod 600 "$key"
+          cd dist
+          for f in *; do
+            ssh-keygen -Y sign -f "$key" -n "jaword-release-$GITHUB_REF_NAME-$f" "$f"
+          done
+          # Extend the checksum list already on the release; a rerun replaces its own lines.
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS --output SHA256SUMS.old
+          grep -v -- '-arm64-darwin$' SHA256SUMS.old > SHA256SUMS || true
+          rm SHA256SUMS.old
+          sha256sum $(ls | grep -v -E '\.sig$|^SHA256SUMS$') >> SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" * --repo "$GITHUB_REPOSITORY" --clobber
