@@ -177,6 +177,17 @@ kbd { font: 500 12.5px var(--mono); color: var(--mute); background: var(--lit); 
 .plate.shown .iconbtn:first-child { color: var(--blue); }
 .iconbtn.done { color: var(--green); }
 .hint.under { min-height: 20px; text-align: right; font: 13px var(--mono); }
+/* People: details with a copy button each, then the sealed numbers. */
+.kv.first { margin-top: 14px; }
+.kv dd.copyable { display: flex; align-items: flex-start; gap: 8px; padding-right: 0; }
+.kv dd.copyable .iconbtn { flex: none; margin: -5px 0 -7px; }
+.kv .lines span { display: block; }
+.caprow { display: flex; align-items: center; margin: 4px 0 8px; }
+.caprow .cap { margin: 0; }
+.caprow + .plate.sub { margin-top: 0; }
+.three { display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 0 12px; }
+.three.gap { margin-top: 12px; }
+.sealedrow { display: grid; grid-template-columns: 1fr 1.3fr auto; gap: 10px; align-items: center; }
 /* Second plate under the card number: security code or PIN. */
 .plate.sub { margin: 0 0 6px; min-height: 44px; padding-top: 4px; padding-bottom: 4px; }
 .plate.sub .lbl { flex: none; color: var(--mute); font-size: 13px; }
@@ -352,3 +363,4 @@ dialog.palette { padding: 0; width: min(560px, calc(100% - 32px)); margin-top: 1
   .choices { grid-template-columns: 1fr; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }
+.plate.sub.shown .iconbtn:first-child { color: var(--mute); }

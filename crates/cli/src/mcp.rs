@@ -22,7 +22,7 @@ fn tools() -> Value {
         },
         {
             "name": "secret_list",
-            "description": "List secrets this agent may see (path, kind, version, metadata). Never returns secret values. Payment cards (kind card) show brand, last four digits and expiry; gift cards (kind gift_card) show the store, last four and balance_cents. Card numbers, security codes and PINs are never returned, and cards can only be added by a person.",
+            "description": "List secrets this agent may see (path, kind, version, metadata). Never returns secret values. Payment cards (kind card) show brand, last four digits and expiry; gift cards (kind gift_card) show the store, last four and balance_cents. Card numbers, security codes and PINs are never returned, and cards can only be added by a person. People and addresses (kind identity) are easier to read with person_list.",
             "inputSchema": {"type": "object", "properties": {"prefix": {"type": "string", "description": "Optional path prefix, e.g. home-lab/"}}}
         },
         {
@@ -90,6 +90,31 @@ fn tools() -> Value {
             "name": "secret_restore",
             "description": "Make an earlier version of a secret current again, for when a new password did not take on the real system. Recorded as a new version. The value is not returned. Version numbers come from secret_get.",
             "inputSchema": {"type": "object", "properties": {"path": path, "version": {"type": "integer"}}, "required": ["path", "version"]}
+        },
+        {
+            "name": "person_list",
+            "description": "List the people and addresses kept in the vault (kind identity): the owner's home and work details, a spouse, relatives. Returns name, email, phone, birthday, company and full address for each, ready to use when filling a form or answering 'what is my work address'. `sealed` lists which identity numbers exist (passport, national ID); their values are never returned.",
+            "inputSchema": {"type": "object", "properties": {"prefix": {"type": "string", "description": "Optional folder prefix, e.g. people/"}}}
+        },
+        {
+            "name": "person_save",
+            "description": "Create or update a person or address. One item per person or place, e.g. path people/me-home titled 'Me, home', people/me-work, people/spouse. Omitted fields are kept on update. Cannot store identity numbers: the owner adds those in the vault UI.",
+            "inputSchema": {"type": "object", "properties": {
+                "path": path,
+                "title": {"type": "string", "description": "What to call it, e.g. Me, work"},
+                "full_name": {"type": "string"},
+                "email": {"type": "string"},
+                "phone": {"type": "string"},
+                "birthday": {"type": "string", "description": "YYYY-MM-DD"},
+                "company": {"type": "string"},
+                "line1": {"type": "string", "description": "Street address"},
+                "line2": {"type": "string", "description": "Apartment, suite, unit"},
+                "city": {"type": "string"},
+                "region": {"type": "string", "description": "State, province or region"},
+                "postal": {"type": "string", "description": "ZIP or postcode"},
+                "country": {"type": "string"},
+                "notes": {"type": "string"}
+            }, "required": ["path"]}
         },
         {
             "name": "gift_card_record",
@@ -219,6 +244,46 @@ fn call(c: &Client, name: &str, args: &Value) -> Result<Value, ApiError> {
         )
         .map_err(|m| ApiError { status: 400, message: m }),
         "secret_restore" => c.post("/v1/secrets/restore", &json!({"path": arg(args, "path")?, "version": args["version"].as_i64().ok_or_else(|| ApiError { status: 400, message: "missing integer argument `version`".into() })?})),
+        "person_list" => {
+            let all = c.list(args["prefix"].as_str().unwrap_or(""))?;
+            let people: Vec<Value> = all
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|x| x["kind"] == "identity")
+                .map(|x| json!({"path": x["path"], "title": x["meta"]["title"], "notes": x["meta"]["notes"], "person": x["meta"]["person"]}))
+                .collect();
+            Ok(json!(people))
+        }
+        "person_save" => {
+            let path = arg(args, "path")?;
+            const FIELDS: [&str; 11] = ["full_name", "email", "phone", "birthday", "company", "line1", "line2", "city", "region", "postal", "country"];
+            let existing = match c.get_secret(path) {
+                Ok(v) => Some(v),
+                Err(e) if e.status == 404 => None,
+                Err(e) => return Err(e),
+            };
+            let mut meta = match &existing {
+                Some(v) if v["kind"] == "identity" => v["meta"].clone(),
+                Some(_) => return Err(ApiError { status: 400, message: "that path holds something that is not a person or address".into() }),
+                None => json!({"person": {}}),
+            };
+            for k in ["title", "notes"] {
+                if let Some(v) = args.get(k).filter(|v| v.is_string()) {
+                    meta[k] = v.clone();
+                }
+            }
+            for k in FIELDS {
+                if let Some(v) = args.get(k).filter(|v| v.is_string()) {
+                    meta["person"][k] = v.clone();
+                }
+            }
+            if existing.is_some() {
+                c.post("/v1/secrets/update", &json!({"path": path, "meta": meta}))
+            } else {
+                c.post("/v1/secrets/create", &json!({"path": path, "kind": "identity", "meta": meta}))
+            }
+        }
         "gift_card_record" => {
             let bad = |m: &str| ApiError { status: 400, message: m.into() };
             let cents = args["amount_cents"].as_i64().filter(|n| *n > 0).ok_or_else(|| bad("`amount_cents` must be a positive integer"))?;

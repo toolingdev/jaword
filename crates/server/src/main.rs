@@ -4,6 +4,7 @@
 mod cards;
 mod drivers;
 mod http;
+mod people;
 mod rotation;
 mod store;
 mod update;

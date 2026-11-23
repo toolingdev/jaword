@@ -245,6 +245,7 @@ function palette() {
     ["New item", () => secretDialog(null, vaultReload || (() => go("secrets")))],
     ["New payment card", () => cardDialog("card", null, vaultReload || (() => go("secrets")))],
     ["New gift card", () => cardDialog("gift_card", null, vaultReload || (() => go("secrets")))],
+    ["New person or address", () => personDialog(null, vaultReload || (() => go("secrets")))],
     ["New folder", () => folderDialog(null, vaultReload || (() => go("secrets")))],
     ["Import from another password manager", () => importDialog(vaultReload || (() => go("secrets")))],
     ["Show passwords overdue for a change", () => { state.onlyStale = true; state.folder = ""; go("secrets"); }],
@@ -259,7 +260,7 @@ function palette() {
   function draw() {
     const q = input.value.trim().toLowerCase();
     const items = state.secrets.filter((s) => !q || itemName(s).toLowerCase().includes(q) || s.path.includes(q) || s.meta.url.toLowerCase().includes(q) || s.meta.username.toLowerCase().includes(q) || s.meta.tags.some((t) => t.toLowerCase().includes(q)))
-      .slice(0, 8).map((s) => ({ label: itemName(s), side: [isCardish(s) ? cardSummary(s) : s.meta.username, folderLabel(folderOf(s.path))].filter(Boolean).join("   "), run: () => { state.selected = s.path; state.folder = ""; state.onlyStale = false; go("secrets"); } }));
+      .slice(0, 8).map((s) => ({ label: itemName(s), side: [isPerson(s) ? personSummary(s) : isCardish(s) ? cardSummary(s) : s.meta.username, folderLabel(folderOf(s.path))].filter(Boolean).join("   "), run: () => { state.selected = s.path; state.folder = ""; state.onlyStale = false; go("secrets"); } }));
     const cmds = commands.filter(([l]) => !q || l.toLowerCase().includes(q)).map(([label, run]) => ({ label, run, cmd: true }));
     rows = q ? [...items, ...cmds] : [...cmds, ...items];
     at = Math.min(at, Math.max(0, rows.length - 1));
@@ -402,7 +403,7 @@ async function viewSecrets(main) {
         onclick: () => { state.selected = s.path; renderTable(); renderDetail(); },
         onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); state.selected = s.path; renderTable(); renderDetail(); } } },
         h("td", { class: "nm" }, itemName(s), !state.folder && folderOf(s.path) && h("small", {}, folderLabel(folderOf(s.path)))),
-        h("td", { class: "us" }, isCardish(s) ? cardSummary(s) : s.meta.username),
+        h("td", { class: "us" }, isPerson(s) ? personSummary(s) : isCardish(s) ? cardSummary(s) : s.meta.username),
         h("td", {}, ageCell(s)),
         h("td", { class: "rot" + (s.has_driver ? " auto" : "") }, s.pending_rotation ? "Pending" : s.has_driver ? (s.rotate_every_days ? every(s.rotate_every_days).replace(/^e/, "E") : "On request") : rotates(s) ? "By hand" : "—"),
         h("td", { class: "ver" }, s.current_version))))));
@@ -413,7 +414,7 @@ async function viewSecrets(main) {
     let d;
     try { d = await api("GET", "/v1/secrets/get?path=" + encodeURIComponent(state.selected)); }
     catch (e) { state.selected = null; return fail(e); }
-    detailEl.replaceChildren(isCardish(d) ? cardPanel(d, reload) : secretPanel(d, reload));
+    detailEl.replaceChildren(isPerson(d) ? personPanel(d, reload) : isCardish(d) ? cardPanel(d, reload) : secretPanel(d, reload));
   }
 
   function render() { renderNotice(); renderTree(); renderTable(); }
@@ -670,7 +671,7 @@ function cardDialog(kind, existing, done, opts) {
     balance: text({ class: "mono", placeholder: existing ? "Starting balance" : "Balance today, like 50.00", inputmode: "decimal", value: existing ? ((info.initial_cents || 0) / 100).toFixed(2) : "", "aria-label": existing ? "Starting balance" : "Balance today" }),
     notes: h("textarea", { placeholder: "Notes", "aria-label": "Notes" }, m.notes || ""),
   };
-  const kindSel = h("select", { "aria-label": "Kind" }, [["card", "Payment card"], ["gift_card", "Gift card"], ["", "Something else…"]].map(([k, l]) => h("option", { value: k, selected: k === kind }, l)));
+  const kindSel = h("select", { "aria-label": "Kind" }, [["card", "Payment card"], ["gift_card", "Gift card"], ["identity", "Person or address"], ["", "Something else…"]].map(([k, l]) => h("option", { value: k, selected: k === kind }, l)));
   const folder = folderPicker(o.folder !== undefined ? o.folder : state.folder || "");
   const err = h("div", { class: "error" });
   const warn = h("div", { class: "hint" });
@@ -686,8 +687,7 @@ function cardDialog(kind, existing, done, opts) {
   folder.el.addEventListener("change", sync);
   kindSel.addEventListener("change", () => {
     dlg.close();
-    if (kindSel.value) cardDialog(kindSel.value, null, done, { title: f.title.value, folder: folder.isNew() ? "" : folder.raw() });
-    else secretDialog(null, done);
+    newOfKind(kindSel.value, done, { title: f.title.value, folder: folder.isNew() ? "" : folder.raw() });
   });
   const dlg = dialog(null,
     h("form", { onsubmit: async (e) => {
@@ -780,6 +780,215 @@ function ledgerDialog(d, sign, done) {
       h("div", { class: "stack" }, noteIn),
       after, err,
       h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, sign < 0 ? "Record spending" : "Add money"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
+        h("span", { class: "hint" }, SAVE_HINT))));
+  quickSave(dlg);
+  dlg.showModal();
+}
+
+// ---- people and addresses -------------------------------------------------
+// Contact details and the address are plain details an agent may read and
+// use. Identity numbers are the sealed value: only their labels show.
+const isPerson = (s) => s.kind === "identity";
+const PERSON_KINDS = { card: "Payment card", gift_card: "Gift card", identity: "Person or address" };
+// Open the right "new" dialog for a kind, carrying over what was typed so far.
+function newOfKind(kind, done, carry) {
+  if (kind === "identity") personDialog(null, done, carry);
+  else if (kind === "card" || kind === "gift_card") cardDialog(kind, null, done, carry);
+  else secretDialog(null, done);
+}
+function addressLines(p) {
+  const place = [p.city, [p.region, p.postal].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  return [p.line1, p.line2, place, p.country].filter(Boolean);
+}
+function personSummary(s) {
+  const p = s.meta.person || {};
+  return [p.full_name, p.line1 || p.city].filter(Boolean).join(", ");
+}
+function birthdayText(iso) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || "");
+  return m ? `${MONTHS[Number(m[2]) - 1]} ${Number(m[3])}, ${m[1]}` : iso || "";
+}
+
+function personPanel(d, reload) {
+  const m = d.meta, p = m.person || {};
+  const note = h("div", { class: "hint under" });
+  let shown = false, hideTimer, tick;
+  async function fetchSealed() {
+    try { return JSON.parse((await api("POST", "/v1/secrets/reveal", { path: d.path })).value) || {}; } catch (e) { if (e && e.status) throw e; return {}; }
+  }
+  const sealed = (p.sealed || []).map((label) => {
+    const val = h("div", { class: "val" }, "•••••••");
+    const copyBtn = iconButton("copy", "Copy " + label, async () => {
+      try {
+        let v;
+        const got = await copyWith(copyBtn, async () => { v = (await fetchSealed())[label]; if (!v) throw new Error("empty"); return v; }, label + " copied. Clipboard clears in 30 seconds");
+        if (got) setTimeout(async () => { try { if (await navigator.clipboard.readText() === v) await navigator.clipboard.writeText(""); } catch (_) { /* tab not focused */ } }, 30000);
+      } catch (e) { fail(e); }
+    });
+    const plate = h("div", { class: "plate sub" }, h("span", { class: "lbl" }, label), val, h("div", { class: "tools" }, copyBtn));
+    return { label, val, plate };
+  });
+  const eye = iconButton("eyeClosed", "Show private numbers", () => (shown ? hide() : reveal()));
+  function hide() {
+    clearTimeout(hideTimer); clearInterval(tick); shown = false; note.textContent = "";
+    sealed.forEach((s) => { s.val.textContent = "•••••••"; s.plate.className = "plate sub"; });
+    eye.setIcon("eyeClosed", "Show private numbers");
+  }
+  async function reveal() {
+    try {
+      const all = await fetchSealed();
+      sealed.forEach((s) => { paint(s.val, all[s.label] || ""); s.plate.className = "plate sub shown"; });
+      shown = true; eye.setIcon("eyeOpen", "Hide private numbers");
+      let left = REVEAL_SECONDS;
+      note.textContent = `Hides in ${left}s`;
+      clearTimeout(hideTimer); clearInterval(tick);
+      tick = setInterval(() => { left -= 1; note.textContent = `Hides in ${left}s`; }, 1000);
+      hideTimer = setTimeout(hide, REVEAL_SECONDS * 1000);
+    } catch (e) { fail(e); }
+  }
+  async function act(path, body, okMsg) {
+    try { await api("POST", path, body); toast(okMsg); reload(); } catch (e) { fail(e); }
+  }
+  // A detail row with its own copy button: these get pasted into forms a lot.
+  const row = (label, text, shownAs) => {
+    if (!text) return [];
+    const b = iconButton("copy", "Copy " + label.toLowerCase(), () => copyWith(b, async () => text, label + " copied"));
+    return [h("dt", {}, label), h("dd", { class: "copyable" }, h("span", { class: "grow" }, shownAs || text), b)];
+  };
+  const addr = addressLines(p);
+  return h("div", { class: "insp" },
+    h("div", { class: "top" },
+      h("div", { class: "grow" }, h("h3", {}, m.title || p.full_name || pretty(leafOf(d.path))), h("div", { class: "where" }, folderLabel(folderOf(d.path))))),
+    h("dl", { class: "kv first" },
+      row("Name", p.full_name), row("Email", p.email), row("Phone", p.phone),
+      row("Birthday", p.birthday, birthdayText(p.birthday)), row("Company", p.company),
+      row("Address", addr.join("\n"), h("span", { class: "lines" }, addr.map((l) => h("span", {}, l)))),
+      m.notes && h("dt", {}, "Notes"), m.notes && h("dd", {}, m.notes),
+      h("dt", {}, "Known as"), h("dd", { class: "mono", title: "What agents and access rules use to refer to this item" }, d.path)),
+    sealed.length > 0 && h("div", { class: "caprow" }, h("div", { class: "cap grow" }, "Private numbers, sealed"), eye),
+    sealed.map((s) => s.plate), sealed.length > 0 && note,
+    h("div", { class: "row" },
+      h("button", { class: "btn primary", onclick: () => personDialog(d, reload) }, "Edit"),
+      h("button", { class: "btn", onclick: () => sealedDialog(d, reload) }, sealed.length ? "Private numbers" : "Add a private number"),
+      h("button", { class: "btn", onclick: () => moveDialog(d, reload) }, "Move")),
+    h("p", { class: "hint" }, "Agents you connect can read the details above. They cannot read private numbers."),
+    h("div", { class: "row end" }, h("button", { class: "link danger", onclick: () => confirm(`Delete ${itemName(d)}?`) && act("/v1/secrets/delete", { path: d.path }, "Deleted") }, "Delete")));
+}
+
+function personDialog(existing, done, opts) {
+  const o = opts || {};
+  const m = existing ? existing.meta : { title: o.title || "", username: "", url: "", notes: "", tags: [] };
+  const p = (existing && m.person) || {};
+  const text = (key, placeholder, extra) => h("input", Object.assign({ type: "text", autocomplete: "off", spellcheck: "false", maxlength: "200", placeholder, value: p[key] || "", "aria-label": placeholder }, extra || {}));
+  const f = {
+    title: h("input", { class: "big", type: "text", placeholder: "What to call it, like Me, home or Mom", value: m.title || "", autocomplete: "off", maxlength: "200", required: true, autofocus: true, "aria-label": "Name of this entry" }),
+    full_name: text("full_name", "Full name"),
+    email: text("email", "Email", { inputmode: "email" }),
+    phone: text("phone", "Phone", { inputmode: "tel" }),
+    birthday: text("birthday", "Birthday, YYYY-MM-DD", { class: "mono", inputmode: "numeric", maxlength: "10" }),
+    company: text("company", "Company"),
+    line1: text("line1", "Street address"),
+    line2: text("line2", "Apartment, suite, unit"),
+    city: text("city", "City"),
+    region: text("region", "State"),
+    postal: text("postal", "ZIP", { class: "mono", maxlength: "16" }),
+    country: text("country", "Country"),
+    notes: h("textarea", { placeholder: "Notes", "aria-label": "Notes" }, m.notes || ""),
+  };
+  const kindSel = h("select", { "aria-label": "Kind" }, [["identity", PERSON_KINDS.identity], ["card", PERSON_KINDS.card], ["gift_card", PERSON_KINDS.gift_card], ["", "Something else…"]].map(([k, l]) => h("option", { value: k, selected: k === "identity" }, l)));
+  const folder = folderPicker(o.folder !== undefined ? o.folder : state.folder || "");
+  const err = h("div", { class: "error" });
+  const where = h("span", { class: "hint" });
+  const target = () => { const dir = folder.value(); return (dir ? dir + "/" : "") + (slug(f.title.value) || "person"); };
+  const sync = () => { if (!existing) where.textContent = "Agents will know it as " + target(); };
+  [f.title, folder.el].forEach((el) => el.addEventListener("input", sync));
+  folder.el.addEventListener("change", sync);
+  kindSel.addEventListener("change", () => { dlg.close(); newOfKind(kindSel.value, done, { title: f.title.value, folder: folder.isNew() ? "" : folder.raw() }); });
+  const dlg = dialog(null,
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = "";
+      const bday = f.birthday.value.trim();
+      if (bday && !/^\d{4}-\d{2}-\d{2}$/.test(bday)) { err.textContent = "Write the birthday like 1990-04-23."; return; }
+      const person = Object.assign({}, p);
+      ["full_name", "email", "phone", "company", "line1", "line2", "city", "region", "postal", "country"].forEach((k) => { person[k] = f[k].value.trim(); });
+      person.birthday = bday;
+      const meta = Object.assign({}, m, { title: f.title.value.trim(), notes: f.notes.value, person });
+      delete meta.policy;
+      const body = existing ? { path: existing.path, meta } : { path: target(), kind: "identity", meta };
+      try {
+        if (!existing && !folder.valid()) { err.textContent = "Give the new folder a name."; return; }
+        await api("POST", existing ? "/v1/secrets/update" : "/v1/secrets/create", body);
+        if (!existing) state.selected = body.path;
+        dlg.close(); toast(existing ? "Saved" : "Added to the vault"); done();
+      } catch (ex) {
+        if (ex.status === 401 || ex.code === "sealed") { dlg.close(); return fail(ex); }
+        err.textContent = ex.status === 409 ? "This folder already has an item with that name." : ex.message;
+      }
+    } },
+      h("div", { class: "title" }, h("h3", {}, existing ? "Edit " + itemName(existing) : "New person or address"), !existing && where),
+      f.title,
+      h("div", { class: "two gap" }, f.full_name, f.company),
+      h("div", { class: "two gap" }, f.email, f.phone),
+      h("div", { class: "stack" }, f.line1, f.line2),
+      h("div", { class: "three gap" }, f.city, f.region, f.postal),
+      h("div", { class: "two gap" }, f.country, f.birthday),
+      !existing && h("div", { class: "two gap" }, h("div", {}, h("label", {}, "Folder"), folder.el), h("div", {}, h("label", {}, "Kind"), kindSel)),
+      h("div", { class: "stack" }, f.notes),
+      h("p", { class: "hint" }, "Fill in only what you want kept. Passport, license and ID numbers go in Private numbers, where they stay sealed."),
+      err,
+      h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, existing ? "Save changes" : "Add to vault"),
+        h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
+        h("span", { class: "hint" }, SAVE_HINT))));
+  quickSave(dlg);
+  sync();
+  dlg.showModal();
+}
+
+// Passport, licence and ID numbers: the sealed part of a person.
+async function sealedDialog(d, done) {
+  let current = {};
+  try { current = JSON.parse((await api("POST", "/v1/secrets/reveal", { path: d.path })).value) || {}; }
+  catch (e) { if (e && e.status === 403) return toast("This access token may not see private numbers.", true); if (e && e.status) return fail(e); }
+  const rowsEl = h("div", { class: "stack" });
+  const err = h("div", { class: "error" });
+  const hints = h("datalist", { id: "sealed-labels" }, ["Social Security number", "Passport", "Driver's license", "State ID", "Tax ID", "Known Traveler Number", "Insurance member ID"].map((l) => h("option", { value: l })));
+  function addRow(label, number) {
+    const l = h("input", { type: "text", placeholder: "What it is, like Passport", value: label || "", maxlength: "40", autocomplete: "off", list: "sealed-labels", "aria-label": "What this number is" });
+    const n = h("input", { class: "mono", type: "text", placeholder: "Number", value: number || "", maxlength: "200", autocomplete: "off", spellcheck: "false", "aria-label": "Number" });
+    const rm = h("button", { class: "link danger", type: "button", onclick: () => r.remove() }, "Remove");
+    const r = h("div", { class: "sealedrow" }, l, n, rm);
+    r.read = () => [l.value.trim(), n.value.trim()];
+    rowsEl.append(r);
+    return l;
+  }
+  Object.entries(current).forEach(([l, n]) => addRow(l, n));
+  if (!rowsEl.children.length) addRow();
+  const dlg = dialog(null,
+    h("form", { onsubmit: async (e) => {
+      e.preventDefault(); err.textContent = "";
+      const next = {};
+      for (const r of rowsEl.children) {
+        const [label, number] = r.read();
+        if (!label && !number) continue;
+        if (!label || !number) { err.textContent = "Each number needs both a name and a value."; return; }
+        if (label in next) { err.textContent = `"${label}" is listed twice.`; return; }
+        next[label] = number;
+      }
+      try {
+        await api("POST", "/v1/secrets/update", { path: d.path, value: JSON.stringify(next) });
+        dlg.close(); toast("Saved and sealed"); done();
+      } catch (ex) {
+        if (ex.status === 401 || ex.code === "sealed") { dlg.close(); return fail(ex); }
+        err.textContent = ex.status === 403 ? "This access token may not save private numbers. Ask an admin for the write permission." : ex.message;
+      }
+    } },
+      h("div", { class: "title" }, h("h3", {}, "Private numbers for " + itemName(d))),
+      hints, rowsEl,
+      h("button", { class: "link", type: "button", onclick: () => addRow().focus() }, "+  Add another"),
+      h("p", { class: "hint" }, "These are sealed like passwords. Agents can see that a passport number is on file, never the number."),
+      err,
+      h("div", { class: "actions" }, h("button", { class: "btn primary", type: "submit" }, "Save"),
         h("button", { class: "btn ghost", type: "button", onclick: () => dlg.close() }, "Cancel"),
         h("span", { class: "hint" }, SAVE_HINT))));
   quickSave(dlg);
@@ -926,7 +1135,7 @@ const SAVE_HINT = (MAC ? "⌘" : "Ctrl") + " Enter to save";
 
 function secretDialog(existing, done) {
   const m = existing ? existing.meta : { title: "", username: "", url: "", notes: "", tags: [] };
-  const kinds = [["password", "Login or password"], ["card", "Payment card"], ["gift_card", "Gift card"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]];
+  const kinds = [["password", "Login or password"], ["card", "Payment card"], ["gift_card", "Gift card"], ["identity", "Person or address"], ["api_key", "API key"], ["ssh_key", "SSH key"], ["config", "Configuration"], ["note", "Secure note"]];
   const f = {
     title: h("input", { class: "big", type: "text", placeholder: "Name, like GitHub or Proxmox root", value: m.title || "", autocomplete: "off", maxlength: "200", autofocus: true, required: !existing, "aria-label": "Name" }),
     kind: h("select", {}, kinds.map(([k, l]) => h("option", { value: k }, l))),
@@ -958,9 +1167,9 @@ function secretDialog(existing, done) {
   [folder.el, f.kind].forEach((el) => el.addEventListener("change", sync));
   // Cards have their own fields: hand over to the card dialog, keeping the name.
   f.kind.addEventListener("change", () => {
-    if (f.kind.value !== "card" && f.kind.value !== "gift_card") return;
+    if (!(f.kind.value in PERSON_KINDS)) return;
     dlg.close();
-    cardDialog(f.kind.value, null, done, { title: f.title.value, folder: folder.isNew() ? "" : folder.raw() });
+    newOfKind(f.kind.value, done, { title: f.title.value, folder: folder.isNew() ? "" : folder.raw() });
   });
   const dlg = dialog(null,
     h("form", { onsubmit: async (e) => {

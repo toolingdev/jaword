@@ -25,10 +25,11 @@ use zeroize::Zeroizing;
 
 use crate::cards::{self, CardInfo, GiftInfo};
 use crate::drivers::{Driver, RotationSetup};
+use crate::people::{self, PersonInfo};
 
 pub const MAX_VALUE: usize = 16 * 1024;
 pub const MIN_PASSPHRASE: usize = 14;
-const KINDS: &[&str] = &["password", "api_key", "ssh_key", "config", "note", cards::CARD, cards::GIFT_CARD];
+const KINDS: &[&str] = &["password", "api_key", "ssh_key", "config", "note", cards::CARD, cards::GIFT_CARD, people::IDENTITY];
 
 #[derive(Debug)]
 pub enum VErr {
@@ -121,6 +122,14 @@ pub struct Meta {
     /// Present on gift cards only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gift: Option<GiftInfo>,
+    /// Present on people and addresses only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<PersonInfo>,
+}
+
+/// Kinds whose value a person types in: never generated, never rotated.
+fn entered_kind(kind: &str) -> bool {
+    cards::is_card_kind(kind) || kind == people::IDENTITY
 }
 
 /// Make card metadata consistent with the item's kind and value. The brand,
@@ -131,7 +140,22 @@ fn settle_cards(kind: &str, meta: &mut Meta, old: Option<&Meta>, value: Option<&
         (true, Some(v)) => Some(cards::inspect(kind, v).map_err(|e| VErr::BadRequest(e.into()))?),
         _ => None,
     };
+    if kind != people::IDENTITY {
+        meta.person = None;
+    }
     match kind {
+        people::IDENTITY => {
+            meta.card = None;
+            meta.gift = None;
+            meta.policy = None;
+            let p = meta.person.get_or_insert_with(PersonInfo::default);
+            p.sealed = match (value, old.and_then(|m| m.person.as_ref())) {
+                (Some(v), _) => people::inspect(v).map_err(|e| VErr::BadRequest(e.into()))?,
+                (None, Some(prev)) => prev.sealed.clone(),
+                (None, None) => Vec::new(),
+            };
+            people::validate(p).map_err(|e| VErr::BadRequest(e.into()))
+        }
         cards::CARD => {
             meta.gift = None;
             meta.policy = None;
@@ -176,6 +200,9 @@ fn settle_cards(kind: &str, meta: &mut Meta, old: Option<&Meta>, value: Option<&
 }
 
 fn no_cards(kind: &str) -> R<()> {
+    if kind == people::IDENTITY {
+        return bad("a person's details cannot be generated or rotated");
+    }
     if cards::is_card_kind(kind) {
         return bad("a card number cannot be generated or rotated; enter the new card details instead");
     }
@@ -959,11 +986,17 @@ impl Vault {
                 a.require(Cap::Write, path)?;
             }
             if !KINDS.contains(&kind) {
-                return bad("kind must be one of password, api_key, ssh_key, config, note, card, gift_card");
+                return bad("kind must be one of password, api_key, ssh_key, config, note, card, gift_card, identity");
             }
             if policy.is_some() {
                 meta.policy = policy;
             }
+            // A person with no sealed numbers still needs a value: an empty set,
+            // never a generated password. Storing it needs no write permission.
+            let value = match value {
+                None if kind == people::IDENTITY => Some(Zeroizing::new(people::EMPTY_VALUE.to_string())),
+                v => v,
+            };
             settle_cards(kind, &mut meta, None, value.as_ref().map(|v| v.as_str()))?;
             meta.validate()?;
             let value = match value {
@@ -1073,7 +1106,7 @@ impl Vault {
                 // A new card number changes the last four digits, so the
                 // metadata follows the value even when only the value was sent.
                 let mut meta = meta.clone();
-                if meta.is_none() && value.is_some() && cards::is_card_kind(&s.kind) {
+                if meta.is_none() && value.is_some() && entered_kind(&s.kind) {
                     meta = Some(old.clone());
                 }
                 if let Some(m) = meta.as_mut() {
@@ -1199,7 +1232,7 @@ impl Vault {
                 }
                 let old = read_version(&tx, k, &s.id, version)?;
                 promote_new(&tx, k, &s.id, old.as_bytes(), &a.label())?;
-                if cards::is_card_kind(&s.kind) {
+                if entered_kind(&s.kind) {
                     // The restored card may be a different card: keep the label honest.
                     let mut meta: Meta = serde_json::from_slice(&crypto::open(&k.meta, &aad_meta(&s.id), &s.meta_blob)?)?;
                     let before = meta.clone();
@@ -1880,6 +1913,61 @@ mod tests {
 
         // Old stored metadata (no card fields) still reads, and stays byte-compatible.
         assert_eq!(serde_json::to_string(&Meta::default()).unwrap().contains("card"), false);
+    }
+
+    #[test]
+    fn people_and_addresses() {
+        let (v, root, _) = vault();
+        let val = |s: &str| Some(Zeroizing::new(s.to_string()));
+        let home = Meta {
+            title: "Me, home".into(),
+            person: Some(PersonInfo {
+                full_name: "Test Person".into(),
+                line1: "1 Example Street".into(),
+                city: "Springfield".into(),
+                sealed: vec!["Made up".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // An agent can save and read a person, with no sealed numbers and no write permission.
+        let a = agent(&v, &root, vec![Cap::List, Cap::Create, Cap::Update]);
+        let p = v.create(&a, "infra/me-home", "identity", home.clone(), None, None).unwrap();
+        let info = p.meta.person.unwrap();
+        assert_eq!((info.city.as_str(), info.sealed.len()), ("Springfield", 0));
+        assert_eq!(v.list(&a, "infra/").unwrap()[0].meta.person.as_ref().unwrap().line1, "1 Example Street");
+
+        // Sealed numbers: labels are visible, numbers are not, and only a person can add them.
+        let ids = r#"{"Passport":"X1234567","SSN":"000-00-0000"}"#;
+        assert!(matches!(v.update(&a, "infra/me-home", None, val(ids)), Err(VErr::Forbidden)));
+        let p = v.update(&root, "infra/me-home", None, val(ids)).unwrap();
+        assert_eq!(p.meta.person.as_ref().unwrap().sealed, vec!["Passport".to_string(), "SSN".to_string()]);
+        assert_eq!(p.meta.person.as_ref().unwrap().city, "Springfield");
+        let seen = serde_json::to_string(&v.get(&a, "infra/me-home").unwrap()).unwrap();
+        assert!(seen.contains("Passport") && !seen.contains("X1234567") && !seen.contains("000-00-0000"));
+        assert!(matches!(v.reveal(&a, "infra/me-home", None), Err(VErr::Forbidden)));
+        assert_eq!(v.reveal(&root, "infra/me-home", None).unwrap().as_str(), ids);
+
+        // Editing details keeps the sealed labels the vault derived, whatever the caller claims.
+        let mut m = v.get(&a, "infra/me-home").unwrap().secret.meta;
+        let pi = m.person.as_mut().unwrap();
+        pi.sealed.clear();
+        pi.city = "Shelbyville".into();
+        let p = v.update(&a, "infra/me-home", Some(m), None).unwrap();
+        let pi = p.meta.person.unwrap();
+        assert_eq!((pi.city.as_str(), pi.sealed.len()), ("Shelbyville", 2));
+
+        // Never generated, never rotated; bad details and bad numbers are refused.
+        assert!(matches!(v.generate(&root, "infra/me-home", None), Err(VErr::BadRequest(_))));
+        let bad = Meta { person: Some(PersonInfo { birthday: "tomorrow".into(), ..Default::default() }), ..Default::default() };
+        assert!(matches!(v.create(&root, "infra/bad", "identity", bad, None, None), Err(VErr::BadRequest(_))));
+        assert!(matches!(v.create(&root, "infra/bad", "identity", Meta::default(), val("X1234567"), None), Err(VErr::BadRequest(_))));
+
+        // Person details do not stick to other kinds.
+        let stray = Meta { person: Some(PersonInfo::default()), ..Default::default() };
+        assert!(v.create(&root, "infra/pw2", "password", stray, None, None).unwrap().meta.person.is_none());
+        assert!(!serde_json::to_string(&Meta::default()).unwrap().contains("person"));
     }
 
     #[test]

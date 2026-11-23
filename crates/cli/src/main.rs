@@ -81,6 +81,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: GiftCmd,
     },
+    /// People and addresses: yours, a relative's, home, work
+    Person {
+        #[command(subcommand)]
+        cmd: PersonCmd,
+    },
     /// Store a value you supply as a new version (hidden prompt or --stdin)
     Set {
         path: String,
@@ -223,6 +228,82 @@ enum CardCmd {
         #[arg(long, default_value = "")]
         notes: String,
     },
+}
+
+#[derive(clap::Args)]
+struct PersonArgs {
+    /// Full name
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    email: Option<String>,
+    #[arg(long)]
+    phone: Option<String>,
+    /// Date of birth as YYYY-MM-DD
+    #[arg(long)]
+    birthday: Option<String>,
+    #[arg(long)]
+    company: Option<String>,
+    /// Street address
+    #[arg(long)]
+    line1: Option<String>,
+    /// Apartment, suite, unit
+    #[arg(long)]
+    line2: Option<String>,
+    #[arg(long)]
+    city: Option<String>,
+    /// State, province or region
+    #[arg(long)]
+    state: Option<String>,
+    /// ZIP or postcode
+    #[arg(long)]
+    zip: Option<String>,
+    #[arg(long)]
+    country: Option<String>,
+}
+
+impl PersonArgs {
+    /// Lay the given details over what is already stored.
+    fn apply(&self, person: &mut Value) {
+        let pairs = [
+            ("full_name", &self.name), ("email", &self.email), ("phone", &self.phone), ("birthday", &self.birthday),
+            ("company", &self.company), ("line1", &self.line1), ("line2", &self.line2), ("city", &self.city),
+            ("region", &self.state), ("postal", &self.zip), ("country", &self.country),
+        ];
+        for (key, value) in pairs {
+            if let Some(v) = value {
+                person[key] = json!(v);
+            }
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PersonCmd {
+    /// Add a person or address, e.g. `jaword person new people/me-home --title "Me, home" --name "..." --line1 "..." --city ... --state CA --zip ...`
+    New {
+        path: String,
+        /// What to call it, e.g. "Me, work" or a relative's name
+        #[arg(long, default_value = "")]
+        title: String,
+        #[command(flatten)]
+        details: PersonArgs,
+        /// A number to keep sealed, typed at a hidden prompt. Repeat for more, e.g. --private Passport --private SSN
+        #[arg(long = "private")]
+        private: Vec<String>,
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
+    /// Change details; anything you leave out is kept
+    Edit {
+        path: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[command(flatten)]
+        details: PersonArgs,
+    },
+    /// List people and addresses with their details (never the sealed numbers)
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -571,6 +652,33 @@ fn card_label(v: &Value) -> String {
     }
 }
 
+/// One-line summary of a person or address for listings.
+fn person_label(v: &Value) -> String {
+    let p = &v["meta"]["person"];
+    if !p.is_object() {
+        return String::new();
+    }
+    let place = [s(&p["city"]), s(&p["region"])].iter().filter(|x| !x.is_empty()).cloned().collect::<Vec<_>>().join(" ");
+    [s(&p["full_name"]), s(&p["line1"]), place.as_str()].iter().filter(|x| !x.is_empty()).cloned().collect::<Vec<_>>().join(", ")
+}
+
+fn print_person(v: &Value) {
+    let p = &v["meta"]["person"];
+    let rows = [
+        ("name", "full_name"), ("email", "email"), ("phone", "phone"), ("birthday", "birthday"), ("company", "company"),
+        ("address", "line1"), ("", "line2"), ("city", "city"), ("state", "region"), ("zip", "postal"), ("country", "country"),
+    ];
+    for (label, key) in rows {
+        if !s(&p[key]).is_empty() {
+            println!("{:<9} {}", if label.is_empty() { String::new() } else { format!("{label}:") }, s(&p[key]));
+        }
+    }
+    let sealed: Vec<&str> = p["sealed"].as_array().into_iter().flatten().map(s).collect();
+    if !sealed.is_empty() {
+        println!("sealed:   {} (use `jaword reveal`)", sealed.join(", "));
+    }
+}
+
 fn s(v: &Value) -> &str {
     v.as_str().unwrap_or("")
 }
@@ -588,7 +696,7 @@ fn print_secret_line(v: &Value) {
         v["current_version"],
         flags,
         fmt_ts(v["updated_at"].as_i64().unwrap_or(0)),
-        if v["meta"]["card"].is_object() || v["meta"]["gift"].is_object() { card_label(v) } else { s(&v["meta"]["username"]).to_string() }
+        if v["meta"]["person"].is_object() { person_label(v) } else if v["meta"]["card"].is_object() || v["meta"]["gift"].is_object() { card_label(v) } else { s(&v["meta"]["username"]).to_string() }
     );
 }
 
@@ -698,6 +806,7 @@ fn main() {
                 if !card_label(&v).is_empty() {
                     println!("card:     {}", card_label(&v));
                 }
+                print_person(&v);
                 println!("driver:   {}", if v["has_driver"].as_bool().unwrap_or(false) { "configured" } else { "none" });
                 println!("\nversion  state     created            by");
                 for x in v["versions"].as_array().into_iter().flatten() {
@@ -734,6 +843,48 @@ fn main() {
             let v = check(c.post("/v1/secrets/create", &body));
             println!("saved {}: {}", s(&v["path"]), card_label(&v));
         }
+        Cmd::Person { cmd } => match cmd {
+            PersonCmd::New { path, title, details, private, notes } => {
+                let mut person = json!({});
+                details.apply(&mut person);
+                let mut body = json!({"path": path, "kind": "identity", "meta": {"title": title, "notes": notes, "person": person}});
+                if !private.is_empty() {
+                    let mut sealed = serde_json::Map::new();
+                    for label in &private {
+                        let number = prompt_secret(&format!("{label}: "));
+                        sealed.insert(label.clone(), json!(number.trim()));
+                    }
+                    body["value"] = json!(Value::Object(sealed).to_string());
+                }
+                let v = check(c.post("/v1/secrets/create", &body));
+                println!("saved {}: {}", s(&v["path"]), person_label(&v));
+            }
+            PersonCmd::Edit { path, title, details } => {
+                let mut meta = check(c.get_secret(&path))["meta"].clone();
+                if !meta["person"].is_object() {
+                    die("that item is not a person or address");
+                }
+                if let Some(t) = title {
+                    meta["title"] = json!(t);
+                }
+                details.apply(&mut meta["person"]);
+                let v = check(c.post("/v1/secrets/update", &json!({"path": path, "meta": meta})));
+                println!("saved {}: {}", s(&v["path"]), person_label(&v));
+            }
+            PersonCmd::Ls => {
+                let all = check(c.list(""));
+                let people: Vec<&Value> = all.as_array().into_iter().flatten().filter(|x| s(&x["kind"]) == "identity").collect();
+                if raw {
+                    out(&json!(people));
+                } else {
+                    for v in people {
+                        println!("{}  ({})", if s(&v["meta"]["title"]).is_empty() { s(&v["path"]) } else { s(&v["meta"]["title"]) }, s(&v["path"]));
+                        print_person(v);
+                        println!();
+                    }
+                }
+            }
+        },
         Cmd::Gift { cmd } => match cmd {
             GiftCmd::New { path, title, merchant, balance, notes } => {
                 let initial = if balance.trim() == "0" { 0 } else { parse_money(&balance) };
@@ -1000,6 +1151,8 @@ mod tests {
         assert_eq!(parse_expiry("12/2031"), (12, 2031));
         let card = json!({"meta": {"card": {"brand": "Visa", "last4": "1111", "exp_month": 8, "exp_year": 2029}}});
         assert_eq!(card_label(&card), "Visa ending 1111  exp 08/29");
+        let who = json!({"meta": {"person": {"full_name": "Test Person", "line1": "1 Example Street", "city": "Springfield", "region": "CA"}}});
+        assert_eq!(person_label(&who), "Test Person, 1 Example Street, Springfield CA");
         let gift = json!({"balance_cents": 3766, "meta": {"gift": {"merchant": "Bookshop", "last4": "XYZ9"}}});
         assert_eq!(card_label(&gift), "Bookshop ending XYZ9  $37.66 left");
         assert_eq!(urlencode("a b&c=d#e"), "a%20b%26c%3Dd%23e");

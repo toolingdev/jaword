@@ -247,6 +247,29 @@ Card numbers cannot be generated or rotated. Having an agent pay with a
 stored card needs a browser extension that fills the page after a human
 approves, which is not built yet.
 
+## People and addresses
+
+An item of kind `identity` holds one person or one place: your home details,
+your work address, a spouse, a relative. Keep as many as you need.
+
+- Name, email, phone, birthday, company and address are plain details. Any
+  token that may list the item can read them, because an agent has to read an
+  address to use it. Scope tokens by folder to limit whose details an agent
+  sees.
+- Passport, licence and ID numbers are the sealed value. Agents see that one
+  is on file, never the number, and cannot add one.
+
+```bash
+jaword person new people/me-home --title "Me, home" --name "..." --line1 "..." --city ... --state CA --zip ...
+jaword person new people/me-work --title "Me, work" --company "..." --line1 "..."
+jaword person edit people/me-home --phone 555-0100
+jaword person new people/me-ids --title "My IDs" --private Passport --private "Driver's license"
+jaword person ls
+```
+
+Over MCP: `person_list` returns everyone the token may see, `person_save`
+creates or updates details.
+
 ## Not built yet
 
 Browser extension (including approved card fill for agents), mobile apps, passkey login, auto-unseal, built-in drivers
